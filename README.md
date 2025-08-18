@@ -1,6 +1,6 @@
-# RAG + Image Captioning — Step-by-Step README
+# RAG — Step-by-Step README
 
-This README gives you **two complete, college-ready project blueprints**:
+This README gives you **complete, project blueprints**:
 
 1. **Retrieval-Augmented Generation (RAG) for Course/Domain QA**
 
@@ -180,3 +180,4 @@ streamlit run rag/app_streamlit.py
 ## Final word
 
 These two projects cover **IR + LLM grounding** and **vision–language modeling**. They are resume-grade if you show: clear metrics, a live demo, sensible ablations, and honest failure analysis. Build the baseline fast, then polish one or two stretch goals. That’s how you win the evaluation without boiling the ocean.
+
