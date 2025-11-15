@@ -1,0 +1,68 @@
+RAG Multi-Query Evaluation Results
+============================================================
+
+Question 1: Who is Voldemort and why is he feared?
+Answer:
+Voldemort is a powerful wizard who started gaining followers about twenty years ago, causing "Dark days" where people didn't know who to trust or dare to get friendly with strange wizards or witches. He is referred to as "Lord Voldemort" by his follower Quirrell, who considers him a "great wizard" and his "master." Voldemort believes "there is no good and evil, there is only power, and those too weak to seek it." He had powers Dumbledore says he will never have, and Dumbledore is described as the "only one Voldemort was frightened of." He is still "out there somewhere, perhaps looking for another body to share."
+
+Voldemort is feared because of the "dark days" he caused. People are so afraid of him that they often avoid saying his name, referring to him as "You-Know-Who," as Dumbledore explains that "Fear of a name increases fear of the thing itself." Hagrid gulps and shudders at the mention of his name, and Professor McGonagall flinches. Harry also starts to feel "a prickle of fear every time You-Know-Who was mentioned." People get scared "in case You-Know-Who’s behind" bad events. Hagrid describes him as "bad," "as bad as you could go," "Worse. Worse than worse."
+
+Top Source Chunk (Page 46):
+. bad. As bad as you could go. Worse. Worse than worse. His name was . . .”
+Hagrid gulped, but no words came out. “Could you write it down?” Harry suggested. “Nah — can’t spell it. All right — Voldemort.” Hagrid shuddered. “Don’
+make me say it again. Anyway, this — this wizard, about twenty years ago
+now, started lookin’ fer followers. Got ’em, too — some were afraid, some
+just wanted a bit o’ his power, ’cause he was gettin’ himself power, all right. Dark days, Harry. Didn’t know who ter trust, didn’t dare get friendly with
+strange wizards or witches . .
+------------------------------------------------------------
+
+Question 2: What are the four houses at Hogwarts?
+Answer:
+The four Houses at Hogwarts are Gryffindor, Hufflepuff, Ravenclaw, and Slytherin.
+
+Top Source Chunk (Page 97):
+ceremony because, while you are here, your House will be something like
+your family within Hogwarts. You will have classes with the rest of your
+House, sleep in your House dormitory, and spend free time in your House
+common room. “The four Houses are called Gryffindor, Hufflepuff, Ravenclaw, and
+Slytherin. Each House has its own noble history and each has produced
+outstanding witches and wizards. While you are at Hogwarts, your triumphs
+will earn your House points, while any rule-breaking will lose House points. At the end of the year, the House with the most points is awarded the House
+Cup, a great honor. I hope each of you will be a credit to whichever House
+becomes yours. “The Sorting Ceremony will take place in a few minutes in front of the rest
+of the school. I suggest you all smarten yourselves up as much as you can
+while you are waiting.”
+Her eyes lingered for a moment on Neville’s cloak, which was fastened
+under his left ear, and on Ron’s smudged nose. Harry nervously tried to
+flatten his hair. “I shall return when we are ready for you,” said Professor McGonagall. “Please wait quietly.”
+She left the chamber.
+------------------------------------------------------------
+
+Question 3: How did Harry survive the killing curse as a baby?
+Answer:
+The context states that "You-Know-Who" (Voldemort) tried to kill Harry as a baby with a powerful, evil curse, but "he couldn’t do it." The curse "took care of yer mum an’ dad an’ yer house, even — but it didn’t work on you, an’ that’s why yer famous, Harry. No one ever lived after he decided ter kill ’em, no one except you, an’ he’d killed some o’ the best witches an’ wizards of the age — the McKinnons, the Bones, the Prewetts — an’ you was only a baby, an’ you lived.” The mark on Harry's forehead is what he got when this curse touched him.
+
+However, the provided context does not explain the specific reason or mechanism by which Harry survived the killing curse. It only states that the curse "didn't work on him."
+
+Top Source Chunk (Page 47):
+. “You-Know-Who killed ’em. An’ then — an’ this is the real myst’ry of the
+thing — he tried to kill you, too. Wanted ter make a clean job of it, I suppose,
+or maybe he just liked killin’ by then. But he couldn’t do it. Never wondered
+how you got that mark on yer forehead? That was no ordinary cut. That’s
+what yeh get when a powerful, evil curse touches yeh — took care of yer
+mum an’ dad an’ yer house, even — but it didn’t work on you, an’ that’s why
+yer famous, Harry. No one ever lived after he decided ter kill ’em, no one
+except you, an’ he’d killed some o’ the best witches an’ wizards of the age —
+the McKinnons, the Bones, the Prewetts — an’ you was only a baby, an’ you
+lived.”
+Something very painful was going on in Harry’s mind. As Hagrid’s story
+came to a close, he saw again the blinding flash of green light, more clearly
+than he had ever remembered it before — and he remembered something else,
+for the first time in his life: a high, cold, cruel laugh. Hagrid was watching him sadly. “Took yeh from the ruined house myself, on Dumbledore’s orders. Brought
+yeh ter this lot . . .”
+“Load of old tosh,” said Uncle Vernon. Harry jumped; he had almost
+forgotten that the Dursleys were there. Uncle Vernon certainly seemed to have
+got back his courage. He was glaring at Hagrid and his fists were clenched. “Now, you listen here, boy,” he snarled, “I accept there’s something strange
+
+------------------------------------------------------------
+
