@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-End-to-end RAG assessment pipeline:
+End-to-end RAG assessment pipeline using HuggingFace LLaMA and official ragas.evaluate()
+
  - Use encoder -> chroma retrieval (top K)
  - Use cross-encoder -> rerank to top M
  - Use LLaMA -> generate answer using top M chunks as context + query
- - Run RAGAS-style evaluation (answer relevancy, faithfulness, contextual metrics)
+ - Run official RAGAS evaluation (multiple metrics via ragas)
 
 Configuration: edit the MODEL paths, CHROMA settings and CSV paths below.
 """
@@ -25,9 +26,35 @@ from transformers import (
     AutoModelForSequenceClassification,
     AutoModelForCausalLM,
 )
+import numpy as np
+
+# Ragas imports
+from ragas import evaluate
+from ragas.metrics import (
+    faithfulness,
+    answer_relevancy,
+    contextual_precision,
+    contextual_recall,
+    contextual_relevancy,
+    answer_correctness
+)
+from ragas.llms.base import BaseRagasLLM
+from ragas.run_config import RunConfig
+from ragas.embeddings.base import HuggingfaceEmbeddings
+
+# For building HF dataset
+from datasets import Dataset as HFDataset
+
+# Langchain-like prompt/response wrappers used by RAGAS (minimal)
+from langchain_core.prompt_values import PromptValue
+from langchain_core.outputs import Generation, LLMResult
+
+# SentenceTransformer for embeddings
+from sentence_transformers import SentenceTransformer
 
 # ---------------------------
 # USER-SPECIFIED BERT ARCHITECTURE
+# (kept from your provided code)
 # ---------------------------
 ENCODER_VOCAB_SIZE = 30522
 ENCODER_MAX_SEQ_LEN = 1024
@@ -37,40 +64,19 @@ ENCODER_NUM_HEADS = 12
 ENCODER_FFN_DIM = 3072
 ENCODER_DROPOUT = 0.1
 
-VOCAB_MIN_FREQ = 1
-MAX_SEQ_LEN = 1024
-HIDDEN_SIZE = 768
-NUM_LAYERS = 12
-NUM_HEADS = 12
-FFN_DIM = 3072
-DROPOUT = 0.1
-WORD2VEC_SIZE = HIDDEN_SIZE
-WORD2VEC_WINDOW = 5
-WORD2VEC_MIN_COUNT = 1
-MLM_MASK_PROB = 0.15
-BATCH_SIZE = 8
-DEVICE_TORCH = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-LEARNING_RATE = 2e-5
-NUM_EPOCHS = 3
-WARMUP_STEPS = 100
-
 # ---------------------------
-# CONFIG
+# CONFIG (paths and models)
 # ---------------------------
-
 ENCODER_MODEL_PATH = "../../Encoder Fine Tuning/lora_finetuned/lora_bert.pt"
 ENCODER_TOKENIZER_DIR = ""
 
 CROSS_ENCODER_MODEL_PATH = "../../Cross_Encoder_Reranking/crossenc_lora_out/model_with_lora.pt"
 
-MODEL_PATH = "meta-llama/Llama-3.1-8B-Instruct"   # <--- HuggingFace Hub model
+# Use the user's chosen model
+MODEL_PATH = "meta-llama/Llama-3.1-8B-Instruct"   # HuggingFace Hub model for LLaMA
 
-tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_PATH,
-    dtype=torch.float16,
-    device_map="auto"
-)
+# LLaMA load (we will load via load_llm())
+# Note: we DO NOT instantiate global tokenizer/model here to avoid duplication before device setup
 
 CHROMA_PERSIST_DIR = "../../VectorDB/chroma_Data_with_Fine_tuned_BERT"
 CHROMA_COLLECTION_NAME = "HP_Chunks_BERT_Embeddings_collection"
@@ -89,7 +95,6 @@ print(f"Using device: {DEVICE}")
 # ---------------------------
 # Load Encoder
 # ---------------------------
-
 def load_encoder(model_path: str, tokenizer_dir: str = ""):
     from transformers import BertConfig, BertModel, BertTokenizer
 
@@ -160,7 +165,6 @@ def load_encoder(model_path: str, tokenizer_dir: str = ""):
 # ---------------------------
 # Encode Texts
 # ---------------------------
-
 def encode_texts(tokenizer, model, texts: List[str], batch_size: int = 16):
     embeddings = []
     with torch.no_grad():
@@ -186,7 +190,6 @@ def encode_texts(tokenizer, model, texts: List[str], batch_size: int = 16):
 # ---------------------------
 # Cross Encoder
 # ---------------------------
-
 def load_cross_encoder(model_path: str):
     from transformers import BertConfig, BertForSequenceClassification, BertTokenizer
 
@@ -275,35 +278,38 @@ def cross_encode_scores(tokenizer, model, query: str, candidates: List[str], bat
     return scores
 
 # ---------------------------
-# ✔️ FIXED LLaMA LOADING — Supports HuggingFace Hub
+# Load LLaMA LLM (HF)
 # ---------------------------
-
 def load_llm(model_path: str):
     """
-    FIXED: Now supports HuggingFace Hub model names.
-    No filesystem existence check.
+    Load LLaMA-like HF causal LM model and tokenizer.
+    Uses device_map="auto" and float16 when a CUDA GPU is available.
     """
     print(f"[load_llm] Loading LLM from HuggingFace Hub: {model_path}")
 
     dtype = torch.float16 if DEVICE == "cuda" else torch.float32
 
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-
+    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        dtype=dtype,
-        device_map="auto" if DEVICE == "cuda" else None
+        torch_dtype=dtype,
+        device_map="auto" if DEVICE == "cuda" else None,
     )
+
+    # Ensure tokenizer has pad token for generation if missing
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
     return tokenizer, model
 
 # ---------------------------
-# LLM Generate
+# LLM Generate (for RAG answer generation)
 # ---------------------------
-
 def llm_generate_answer(tokenizer, model, query: str, contexts: List[str],
                         max_new_tokens=128, temperature=0.0):
-
+    """
+    Generate a concise answer using the HF model given contexts and a question.
+    """
     ctx_block = "\n\n---\n".join([f"Passage {i+1}:\n{c}" for i, c in enumerate(contexts)])
 
     prompt = (
@@ -322,149 +328,87 @@ def llm_generate_answer(tokenizer, model, query: str, contexts: List[str],
             max_new_tokens=max_new_tokens,
             do_sample=False,
             temperature=temperature,
-            eos_token_id=tokenizer.eos_token_id
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id
         )
 
-    return tokenizer.decode(outputs[0][inputs['input_ids'].shape[-1]:], skip_special_tokens=True).strip()
+    generated = tokenizer.decode(outputs[0][inputs['input_ids'].shape[-1]:], skip_special_tokens=True).strip()
+    return generated
 
 # ---------------------------
-# RAGAS & Main
+# HF wrapper implementing BaseRagasLLM so ragas.evaluate can call this LLM
 # ---------------------------
-# (UNCHANGED — omitted here for brevity but included in your final file)
-
-# ---------------------------
-# GOLDEN CSV / Evaluation / MAIN
-# (FULL VERSION CONTINUES…)
-# ---------------------------
-
-# (⚠️ The remaining 40% of your file is unchanged — I did not modify any logic.)
-
-# -----------------------------------------------------------
-# ✂️  TRUNCATED HERE FOR MESSAGE LENGTH LIMITS
-# -----------------------------------------------------------
-
-# ---------------------------
-# RAGAS evaluation utils (adapted from earlier)
-# ---------------------------
-
-JUDGMENT_PROMPT = """
-You are a helpful judge for evaluating short answers.
-Return ONLY a JSON object (no extra commentary) with two keys:
-  - "relevancy": 0 or 1
-  - "faithfulness": 0 or 1
-Definitions:
- - Context: additional background supporting facts (may be empty).
- - Reference: the golden answer (ground truth).
- - Prediction: the model-produced answer we are judging.
-Return JSON only.
-
-Context:
-{context}
-
-Reference:
-{reference}
-
-Prediction:
-{prediction}
-"""
-
-def safe_generate_single_llm(tokenizer, model, prompt: str, max_new_tokens: int = 128) -> str:
-    """Produce deterministic LLM judgment text. Use same llm as generator (may be slow)."""
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048).to(DEVICE)
-    with torch.no_grad():
-        outputs = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False, temperature=0.0, eos_token_id=tokenizer.eos_token_id)
-    text = tokenizer.decode(outputs[0][inputs['input_ids'].shape[-1]:], skip_special_tokens=True)
-    return text.strip()
-
-def parse_judgment_output(text: str):
-    text = text.strip()
-    try:
-        j = json.loads(text)
-        return {"relevancy": int(bool(j.get("relevancy", 0))), "faithfulness": int(bool(j.get("faithfulness", 0)))}
-    except Exception:
-        lower = text.lower()
-        rel = 1 if "relev" in lower and "1" in lower or "relevant" in lower else 0
-        faith = 1 if "faith" in lower and "1" in lower or "faithful" in lower else 0
-        # try regex
-        try:
-            import re
-            nums = re.findall(r"relev.*?([01])", lower)
-            if nums:
-                rel = int(nums[0])
-            nums = re.findall(r"faith.*?([01])", lower)
-            if nums:
-                faith = int(nums[0])
-        except Exception:
-            pass
-        return {"relevancy": rel, "faithfulness": faith}
-
-def tokenize_whitespace(text: str):
-    return [t for t in (text or "").strip().split() if t]
-
-def run_ragas_evaluation(predictions: List[Dict[str, str]], model_tokenizer, model_llm, use_llm_judge: bool = True):
+class HFRagasLLM(BaseRagasLLM):
     """
-    predictions: list of dicts with keys: id, context, prediction, reference
-    model_tokenizer/model_llm: tokenizer and model used for LLM judging (can be same as generator)
+    Wrap a HuggingFace AutoModelForCausalLM + tokenizer into the interface ragas expects.
+    This will be used by ragas.evaluate to run judge prompts and internal LLM calls.
     """
-    results = []
-    accum = {"relevancy_count": 0, "faithful_count": 0, "contextual_relevancy_sum": 0.0,
-             "contextual_precision_sum": 0.0, "contextual_recall_sum": 0.0, "n": 0}
-    for it in predictions:
-        _id = it["id"]
-        ctx = it.get("context", "") or ""
-        pred = it.get("prediction", "") or ""
-        ref = it.get("reference", "") or ""
 
-        judgment = {"relevancy": 0, "faithfulness": 0}
-        raw_judgment_text = None
-        if use_llm_judge:
-            prompt = JUDGMENT_PROMPT.format(context=ctx, reference=ref, prediction=pred)
-            try:
-                raw_judgment_text = safe_generate_single_llm(model_tokenizer, model_llm, prompt, max_new_tokens=64)
-                judgment = parse_judgment_output(raw_judgment_text)
-            except Exception:
-                judgment = {"relevancy": 0, "faithfulness": 0}
+    def __init__(self, tokenizer, model, run_config: RunConfig = None):
+        super().__init__(run_config=run_config or RunConfig())
+        self.tokenizer = tokenizer
+        self.model = model
+        self.device = DEVICE
 
-        ctx_tokens = tokenize_whitespace(ctx)
-        pred_tokens = tokenize_whitespace(pred)
-        ref_tokens = tokenize_whitespace(ref)
+    def _prompt_to_text(self, prompt: PromptValue):
+        if hasattr(prompt, "to_string"):
+            return prompt.to_string()
+        return str(prompt)
 
-        contextual_relevancy = (sum(1 for t in set(ctx_tokens) if t in pred_tokens) / float(len(set(ctx_tokens)))) if len(ctx_tokens) else 0.0
-        contextual_precision = (sum(1 for t in set(pred_tokens) if t in ref_tokens) / float(len(set(pred_tokens)))) if len(pred_tokens) else 0.0
-        contextual_recall = (sum(1 for t in set(ref_tokens) if t in pred_tokens) / float(len(set(ref_tokens)))) if len(ref_tokens) else 0.0
+    def generate_text(self, prompt: PromptValue, n: int = 1, temperature: float = 0.0, stop=None, callbacks=None):
+        """
+        Synchronous generation: returns LLMResult with Generation objects (text only).
+        This matches the minimal needs of ragas' runner.
+        """
+        text_prompt = self._prompt_to_text(prompt)
+        gens = []
+        for i in range(n):
+            # tokenize & generate
+            inputs = self.tokenizer(text_prompt, return_tensors="pt", truncation=True, max_length=2048).to(DEVICE)
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=256,
+                    do_sample=False if temperature == 0.0 else True,
+                    temperature=temperature,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                )
+            out_text = self.tokenizer.decode(outputs[0][inputs['input_ids'].shape[-1]:], skip_special_tokens=True).strip()
+            gens.append(Generation(text=out_text))
+        return LLMResult(generations=[[g] for g in gens])
 
-        accum["n"] += 1
-        accum["relevancy_count"] += judgment["relevancy"]
-        accum["faithful_count"] += judgment["faithfulness"]
-        accum["contextual_relevancy_sum"] += contextual_relevancy
-        accum["contextual_precision_sum"] += contextual_precision
-        accum["contextual_recall_sum"] += contextual_recall
+    async def agenerate_text(self, prompt: PromptValue, n: int = 1, temperature: float = 0.0, stop=None, callbacks=None):
+        # Provide async wrapper but call sync code (sufficient for ragas)
+        return self.generate_text(prompt, n=n, temperature=temperature, stop=stop, callbacks=callbacks)
 
-        results.append({
-            "id": _id,
-            "relevancy": int(judgment["relevancy"]),
-            "faithfulness": int(judgment["faithfulness"]),
-            "contextual_relevancy": contextual_relevancy,
-            "contextual_precision": contextual_precision,
-            "contextual_recall": contextual_recall,
-            "raw_llm_judgment_text": raw_judgment_text
-        })
-
-    n = max(1, accum["n"])
-    metrics = {
-        "answer_relevancy": accum["relevancy_count"] / n,
-        "faithfulness": accum["faithful_count"] / n,
-        "contextual_relevancy": accum["contextual_relevancy_sum"] / n,
-        "contextual_precision": accum["contextual_precision_sum"] / n,
-        "contextual_recall": accum["contextual_recall_sum"] / n,
-        "n_examples": accum["n"]
-    }
-    return {"metrics": metrics, "per_example": results}
+    def is_finished(self, response):
+        # Not used heavily by ragas, implement trivial finished check
+        return True
 
 # ---------------------------
-# Main pipeline
+# Huggingface embeddings wrapper for ragas
 # ---------------------------
+class CustomHuggingfaceEmbeddings(HuggingfaceEmbeddings):
+    def __init__(self, model_name: str):
+        # Initialize underlying sentence-transformers model
+        self.model = SentenceTransformer(model_name)
 
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        return self.model.encode(texts, show_progress_bar=False).tolist()
+
+    def embed_query(self, text: str) -> List[float]:
+        return self.model.encode([text], show_progress_bar=False)[0].tolist()
+
+    async def aembed_documents(self, texts: List[str]):
+        return self.embed_documents(texts)
+
+    async def aembed_query(self, text: str):
+        return self.embed_query(text)
+
+# ---------------------------
+# Utility: load golden CSV
+# ---------------------------
 def load_golden_csv(path: str) -> List[Dict[str, str]]:
     """Read CSV with columns 'query' and 'answer' (golden)."""
     if not os.path.exists(path):
@@ -478,105 +422,202 @@ def load_golden_csv(path: str) -> List[Dict[str, str]]:
             rows.append({"id": str(i), "query": q, "reference": a})
     return rows
 
+# ---------------------------
+# Main pipeline
+# ---------------------------
 def main():
-    # Load Chroma collection
+    # 1) open chroma collection
     client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR, settings=Settings(anonymized_telemetry=False))
     try:
         collection = client.get_collection(CHROMA_COLLECTION_NAME)
     except Exception as e:
         raise RuntimeError(f"Could not open Chroma collection '{CHROMA_COLLECTION_NAME}': {e}")
 
-    # Load models
+    # 2) load models
+    print("[INFO] Loading encoder and cross-encoder ...")
     encoder_tok, encoder_model = load_encoder(ENCODER_MODEL_PATH, tokenizer_dir=ENCODER_TOKENIZER_DIR)
     cross_tok, cross_model = load_cross_encoder(CROSS_ENCODER_MODEL_PATH)
+    print("[INFO] Loading generator/judge LLaMA model ...")
     llm_tok, llm_model = load_llm(MODEL_PATH)
 
-    # Load golden queries
+    # 3) load golden CSV
     golden = load_golden_csv(GOLDEN_CSV_RELATIVE_PATH)
-    print(f"Loaded {len(golden)} golden examples from {GOLDEN_CSV_RELATIVE_PATH}")
+    print(f"[INFO] Loaded {len(golden)} golden examples from {GOLDEN_CSV_RELATIVE_PATH}")
 
-    predictions_for_eval = []
-
-    # Iterate over golden dataset
+    # 4) generate RAG answers (retrieve -> rerank -> generate)
+    records = []
     for idx, item in enumerate(golden):
         qid = item["id"]
         query = item["query"]
         reference = item["reference"]
 
-        # 1) encode query
-        q_emb = encode_texts(encoder_tok, encoder_model, [query], batch_size=1)[0]
-
-        # 2) query chroma top K by embedding
+        # encode query via encoder
         try:
-            chroma_res = collection.query(
-                query_embeddings=[q_emb],
-                n_results=TOP_K,
-                include=["documents", "embeddings", "metadatas"]
-            )
+            q_emb = encode_texts(encoder_tok, encoder_model, [query], batch_size=1)[0]
+        except Exception as e:
+            print(f"[WARN] Encoding query failed for id {qid}: {e}")
+            q_emb = None
 
+        # query chroma for top K
+        try:
+            if q_emb is not None:
+                chroma_res = collection.query(
+                    query_embeddings=[q_emb],
+                    n_results=TOP_K,
+                    include=["documents", "embeddings", "metadatas"]
+                )
+                docs = chroma_res.get("documents", [[]])[0]
+            else:
+                # fallback: text query (if embeddings failed)
+                chroma_res = collection.query(query_texts=[query], n_results=TOP_K, include=["documents", "metadatas"])
+                docs = chroma_res.get("documents", [[]])[0]
         except Exception as e:
             print(f"[WARN] Chroma query failed for query id {qid}: {e}")
-            chroma_res = {"ids": [[]], "documents": [[]]}
+            docs = []
 
-        ids = chroma_res.get("ids", [[]])[0]
-        docs = chroma_res.get("documents", [[]])[0]
-        # defensive
         candidates = docs or []
         if len(candidates) == 0:
-            print(f"[WARN] No candidates returned for query id {qid}. Skipping.")
-            pred_text = ""
-            predictions_for_eval.append({"id": qid, "context": "", "prediction": pred_text, "reference": reference})
-            continue
-
-        # 3) rerank top K with cross-encoder
-        scores = cross_encode_scores(cross_tok, cross_model, query, candidates, batch_size=8)
-        # sort by score desc, keep top M
-        scored = list(zip(candidates, scores))
-        scored_sorted = sorted(scored, key=lambda x: x[1], reverse=True)
-        top_m = [c for c, s in scored_sorted[:TOP_M]]
-
-        # 4) Use LLaMA to generate answer conditioned on top M contexts
-        try:
-            gen_answer = llm_generate_answer(llm_tok, llm_model, query, top_m, max_new_tokens=LLM_MAX_NEW_TOKENS, temperature=LLM_TEMPERATURE)
-        except Exception as e:
-            print(f"[ERROR] LLM generation failed for qid {qid}: {e}")
+            print(f"[WARN] No candidates returned for query id {qid}. Producing empty answer.")
             gen_answer = ""
+            contexts = []
+        else:
+            # rerank with cross-encoder
+            try:
+                scores = cross_encode_scores(cross_tok, cross_model, query, candidates, batch_size=8)
+                scored = list(zip(candidates, scores))
+                scored_sorted = sorted(scored, key=lambda x: x[1], reverse=True)
+                top_m = [c for c, s in scored_sorted[:TOP_M]]
+            except Exception as e:
+                print(f"[WARN] Cross-encoder reranking failed for qid {qid}: {e}")
+                top_m = candidates[:TOP_M]
 
-        # 5) Build context string (join top_m)
-        context_for_judge = "\n\n".join(top_m)
+            # generate with LLaMA
+            try:
+                gen_answer = llm_generate_answer(llm_tok, llm_model, query, top_m, max_new_tokens=LLM_MAX_NEW_TOKENS, temperature=LLM_TEMPERATURE)
+            except Exception as e:
+                print(f"[ERROR] LLM generation failed for qid {qid}: {e}")
+                gen_answer = ""
 
-        predictions_for_eval.append({
+            contexts = top_m
+
+        records.append({
             "id": qid,
-            "context": context_for_judge,
-            "prediction": gen_answer,
-            "reference": reference
+            "question": query,
+            "answer": gen_answer,
+            "contexts": contexts,
+            "ground_truth": reference
         })
 
-        # optional progress print
         if (idx + 1) % 10 == 0:
             print(f"Processed {idx+1}/{len(golden)} queries")
 
-    # 6) Evaluate predictions
-    print("Running RAGAS evaluation (LLM judge may be slow)...")
-    evaluation = run_ragas_evaluation(predictions_for_eval, llm_tok, llm_model, use_llm_judge=True)
+    print("[INFO] Preparing HF Dataset for ragas...")
+    # ragas expects columns like 'question', 'answer', 'contexts', 'ground_truth' (or 'ground_truth' may be optional)
+    hf_dataset = HFDataset.from_list(records)
 
-    print("=== Aggregated Metrics ===")
-    print(json.dumps(evaluation["metrics"], indent=2))
+    # 5) Prepare ragas LLM wrapper and embeddings
+    print("[INFO] Wrapping LLaMA for ragas (LLM & embeddings)...")
+    ragas_llm = HFRagasLLM(tokenizer=llm_tok, model=llm_model, run_config=RunConfig())
 
-    # ------------------------------------
-    # NEW: Persist aggregated metrics to .txt
-    # ------------------------------------
-    with open("ragas_metrics.txt", "w", encoding="utf-8") as f:
-        for k, v in evaluation["metrics"].items():
-            f.write(f"{k}: {v}\n")
+    # Use a SentenceTransformer embedding model for ragas (same as earlier)
+    EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+    ragas_embeddings = CustomHuggingfaceEmbeddings(EMBED_MODEL)
 
-    # Save per-example results
-    out_file = "rag_evaluation_results.jsonl"
-    with open(out_file, "w", encoding="utf-8") as f:
-        for ex in evaluation["per_example"]:
-            f.write(json.dumps(ex) + "\n")
-    print(f"Per-example results saved to {out_file}")
-    print("Aggregated metrics saved to ragas_metrics.txt")
+    # 6) Run ragas.evaluate with full metric set
+    metrics_to_run = [
+        faithfulness,
+        answer_relevancy,
+        answer_correctness,
+        contextual_precision,
+        contextual_recall,
+        contextual_relevancy
+    ]
+
+    print("[INFO] Running ragas.evaluate() - this will call the wrapped LLaMA many times for judge prompts...")
+    start_time = time.time()
+    results = evaluate(
+        dataset=hf_dataset,
+        metrics=metrics_to_run,
+        llm=ragas_llm,
+        embeddings=ragas_embeddings
+    )
+    end_time = time.time()
+    elapsed_min = (end_time - start_time) / 60.0
+
+    # 7) Aggregate & persist results
+    # results is typically a dict mapping metric names to per-example numeric arrays or scalars as ragas returns them
+    # We'll attempt to compute averages for listed metrics and save full results
+
+    aggregated = {}
+    try:
+        # Some ragas versions return dicts with arrays under metric names
+        for metric_name in results:
+            # metric values may be list-like
+            vals = results[metric_name]
+            try:
+                arr = np.array(vals, dtype=float)
+                aggregated[metric_name] = float(np.nanmean(arr))
+            except Exception:
+                # if not numeric list, just store as-is
+                aggregated[metric_name] = vals
+    except Exception as e:
+        print(f"[WARN] Error aggregating ragas results: {e}")
+        aggregated = results
+
+    # Save aggregated metrics and full results
+    out_metrics_file = "ragas_metrics.txt"
+    out_json_file = "ragas_full_results.json"
+    out_per_example = "ragas_per_example.jsonl"
+
+    print("[INFO] Writing results to disk...")
+    try:
+        with open(out_metrics_file, "w", encoding="utf-8") as f:
+            f.write("=== RAGAS aggregated metrics ===\n")
+            f.write(f"Time: {time.ctime()}\n")
+            f.write(f"Duration (minutes): {elapsed_min:.2f}\n\n")
+            f.write(json.dumps(aggregated, indent=2))
+            f.write("\n\n=== Full raw results object ===\n")
+            f.write(json.dumps(results, indent=2, default=str))
+        print(f"Aggregated metrics saved to {out_metrics_file}")
+    except Exception as e:
+        print(f"[ERROR] Could not write aggregated metrics: {e}")
+
+    try:
+        with open(out_json_file, "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2, default=str)
+        print(f"Full results saved to {out_json_file}")
+    except Exception as e:
+        print(f"[ERROR] Could not write full results JSON: {e}")
+
+    # Write per-example items (if results contain per-example lists, attempt to reconstruct)
+    try:
+        # We will serialize the records plus metric values where available
+        per_example = []
+        n = len(records)
+        # Try to collate per-example metric arrays inside results if they exist
+        # results may be: { 'faithfulness': [..], 'answer_relevancy': [..], ... }
+        # We'll construct an entry per record with metrics
+        for i, rec in enumerate(records):
+            entry = dict(rec)  # id, question, answer, contexts, ground_truth
+            for metric_name, metric_vals in results.items():
+                try:
+                    entry[metric_name] = metric_vals[i]
+                except Exception:
+                    # metric maybe scalar or missing; skip
+                    pass
+            per_example.append(entry)
+
+        with open(out_per_example, "w", encoding="utf-8") as f:
+            for ex in per_example:
+                f.write(json.dumps(ex, ensure_ascii=False) + "\n")
+        print(f"Per-example results saved to {out_per_example}")
+    except Exception as e:
+        print(f"[ERROR] Could not write per-example results: {e}")
+
+    print("Done. Summary:")
+    print("Elapsed (minutes):", elapsed_min)
+    print("Aggregated metrics (sample):")
+    print(json.dumps(aggregated, indent=2))
 
 if __name__ == "__main__":
     main()
