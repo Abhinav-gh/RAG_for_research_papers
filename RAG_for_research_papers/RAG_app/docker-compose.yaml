@@ -1,0 +1,13 @@
+version: '3.8'
+services:
+  backend:
+    build: ./backend
+    container_name: rag_backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+    restart: unless-stopped
+    environment:
+      - MODEL_PATH=../../Cross Encoder Reranking/crossenc_lora_out/model_with_lora.pt
+      - TOKENIZER_PATH=../../Cross Encoder Reranking/crossenc_lora_out

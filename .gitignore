@@ -2,3 +2,10 @@ nlpragenv
 chroma_Data
 .gradio
 .env
+*.csv
+*.pt
+chroma_Data*
+*.pdf
+*.pkl
+*.json
+*.pth
