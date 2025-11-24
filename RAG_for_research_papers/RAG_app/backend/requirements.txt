@@ -5,3 +5,5 @@ transformers
 scikit-learn
 pandas
 ragas
+chromadb
+peft
