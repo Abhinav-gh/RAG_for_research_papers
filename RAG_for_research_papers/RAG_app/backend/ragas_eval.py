@@ -13,25 +13,19 @@ Configuration: edit the MODEL paths, CHROMA settings and CSV paths below.
 import csv
 import json
 import os
-import random
 import time
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict
 
 import torch
 import chromadb
 from chromadb.config import Settings
-from transformers import (
-    AutoTokenizer,
-    AutoModel,
-    AutoModelForSequenceClassification,
-    AutoModelForCausalLM,
-)
+from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification, AutoModelForCausalLM
 import numpy as np
 
 # GROQ import
 from groq import Groq
 
-# Ragas imports
+# Ragas (0.3.9) metric classes
 from ragas import evaluate
 from ragas.metrics import (
     Faithfulness,
@@ -44,34 +38,28 @@ from ragas.llms.base import BaseRagasLLM
 from ragas.run_config import RunConfig
 from ragas.embeddings.base import HuggingfaceEmbeddings
 
-# For building HF dataset
+# Dataset
 from datasets import Dataset as HFDataset
 
-# Langchain-like prompt/response wrappers used by RAGAS (minimal)
+# langchain_core wrappers expected by ragas
 from langchain_core.prompt_values import PromptValue
 from langchain_core.outputs import Generation, LLMResult
 
-# SentenceTransformer for embeddings
+# sentence-transformers
 from sentence_transformers import SentenceTransformer
 
-# ---------------------------
-# USER-SPECIFIED BERT ARCHITECTURE
-# (kept from your provided code)
-# ---------------------------
-ENCODER_VOCAB_SIZE = 30522
-ENCODER_MAX_SEQ_LEN = 1024
-ENCODER_HIDDEN_SIZE = 768
-ENCODER_NUM_LAYERS = 12
-ENCODER_NUM_HEADS = 12
-ENCODER_FFN_DIM = 3072
-ENCODER_DROPOUT = 0.1
+# Optional backend modules you referenced (kept as imports; ensure they exist in your project)
+# If they are not needed, remove or comment the following imports.
+# from backend.encoder_model import BertEncoder
+# from backend.chromadb_utils import ChromaDBClient
+# from backend.model import CrossEncoderLoRAWrapper
+# from backend.utils import health_check, get_model_info
 
 # ---------------------------
-# CONFIG (paths and models)
+# Config (paths and models)
 # ---------------------------
-ENCODER_MODEL_PATH = "../../Encoder Fine Tuning/lora_finetuned/lora_bert.pt"
+ENCODER_MODEL_PATH = "../../Encoder_Fine_Tuning/lora_finetuned/lora_bert.pt"
 ENCODER_TOKENIZER_DIR = ""
-
 CROSS_ENCODER_MODEL_PATH = "../../Cross_Encoder_Reranking/crossenc_lora_out/model_with_lora.pt"
 
 # For compatibility kept as MODEL_PATH variable (not used for Groq directly)
@@ -83,7 +71,7 @@ GROQ_MODEL_NAME = "llama-3.3-70b-versatile"
 CHROMA_PERSIST_DIR = "../../VectorDB/chroma_Data_with_Fine_tuned_BERT"
 CHROMA_COLLECTION_NAME = "HP_Chunks_BERT_Embeddings_collection"
 
-GOLDEN_CSV_RELATIVE_PATH = "golden_2_without_commas.csv"
+GOLDEN_CSV_RELATIVE_PATH = "temp.csv"
 
 TOP_K = 10
 TOP_M = 5
@@ -91,7 +79,10 @@ TOP_M = 5
 LLM_MAX_NEW_TOKENS = 128
 LLM_TEMPERATURE = 0.0
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# Allow forcing CPU-only loading via env var for low-memory machines
+LLM_LOAD_MODE = os.environ.get("LLM_LOAD_MODE", "").lower()  # values: "", "cpu-only"
+
+DEVICE = "cuda" if torch.cuda.is_available() and LLM_LOAD_MODE != "cpu-only" else "cpu"
 print(f"Using device: {DEVICE}")
 
 # ---------------------------
@@ -117,7 +108,7 @@ def get_next_client():
     return Groq(api_key=key)
 
 # ---------------------------
-# Load Encoder
+# Encoder loader (unchanged logic)
 # ---------------------------
 def load_encoder(model_path: str, tokenizer_dir: str = ""):
     from transformers import BertConfig, BertModel, BertTokenizer
@@ -126,7 +117,7 @@ def load_encoder(model_path: str, tokenizer_dir: str = ""):
         raise FileNotFoundError(f"Encoder model path not found: {model_path}")
 
     if os.path.isdir(model_path):
-        print(f"[load_encoder] Detected directory model.")
+        logger.info("[load_encoder] Detected directory model.")
         tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
         model = AutoModel.from_pretrained(model_path)
         model.to(DEVICE)
@@ -135,30 +126,30 @@ def load_encoder(model_path: str, tokenizer_dir: str = ""):
 
     _, ext = os.path.splitext(model_path)
     if ext.lower() in [".pt", ".pth", ".bin"]:
-        print(f"[load_encoder] Raw checkpoint: {model_path}")
+        logger.info(f"[load_encoder] Raw checkpoint: {model_path}")
         if tokenizer_dir and os.path.isdir(tokenizer_dir):
             tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir, use_fast=False)
         else:
             tokenizer = BertTokenizer.from_pretrained("bert-base-uncased", use_fast=False)
 
         config = BertConfig(
-            vocab_size=ENCODER_VOCAB_SIZE,
-            hidden_size=ENCODER_HIDDEN_SIZE,
-            num_hidden_layers=ENCODER_NUM_LAYERS,
-            num_attention_heads=ENCODER_NUM_HEADS,
-            intermediate_size=ENCODER_FFN_DIM,
-            max_position_embeddings=ENCODER_MAX_SEQ_LEN,
-            hidden_dropout_prob=ENCODER_DROPOUT,
-            attention_probs_dropout_prob=ENCODER_DROPOUT,
+            vocab_size=30522,
+            hidden_size=768,
+            num_hidden_layers=12,
+            num_attention_heads=12,
+            intermediate_size=3072,
+            max_position_embeddings=1024,
+            hidden_dropout_prob=0.1,
+            attention_probs_dropout_prob=0.1,
             pad_token_id=0,
             type_vocab_size=2,
         )
 
         model = BertModel(config)
-
-        print(f"[load_encoder] Loading checkpoint...")
+        logger.info("[load_encoder] Loading checkpoint...")
         state = torch.load(model_path, map_location="cpu")
 
+        # try common key shapes
         if isinstance(state, dict) and not any(k.startswith("bert.") for k in state.keys()):
             for k in ["model_state_dict", "state_dict"]:
                 if k in state:
@@ -167,7 +158,7 @@ def load_encoder(model_path: str, tokenizer_dir: str = ""):
 
         try:
             model.load_state_dict(state, strict=False)
-        except:
+        except Exception:
             new_state = {}
             for k, v in state.items():
                 if k.startswith("module."):
@@ -187,7 +178,7 @@ def load_encoder(model_path: str, tokenizer_dir: str = ""):
     return tokenizer, model
 
 # ---------------------------
-# Encode Texts
+# Text encoder helper (unchanged)
 # ---------------------------
 def encode_texts(tokenizer, model, texts: List[str], batch_size: int = 16):
     embeddings = []
@@ -200,7 +191,6 @@ def encode_texts(tokenizer, model, texts: List[str], batch_size: int = 16):
             out = model(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
 
             last = out.last_hidden_state
-
             mask = attention_mask.unsqueeze(-1)
             summed = (last * mask).sum(dim=1)
             counts = mask.sum(dim=1).clamp(min=1)
@@ -212,7 +202,7 @@ def encode_texts(tokenizer, model, texts: List[str], batch_size: int = 16):
     return embeddings
 
 # ---------------------------
-# Cross Encoder
+# Cross-encoder loader + scoring (unchanged)
 # ---------------------------
 def load_cross_encoder(model_path: str):
     from transformers import BertConfig, BertForSequenceClassification, BertTokenizer
@@ -229,19 +219,19 @@ def load_cross_encoder(model_path: str):
 
     _, ext = os.path.splitext(model_path)
     if ext.lower() in [".pt", ".pth", ".bin"]:
-        print(f"[load_cross_encoder] Raw checkpoint: {model_path}")
+        logger.info(f"[load_cross_encoder] Raw checkpoint: {model_path}")
 
         tokenizer = BertTokenizer.from_pretrained("bert-base-uncased", use_fast=False)
 
         config = BertConfig(
-            vocab_size=ENCODER_VOCAB_SIZE,
-            hidden_size=ENCODER_HIDDEN_SIZE,
-            num_hidden_layers=ENCODER_NUM_LAYERS,
-            num_attention_heads=ENCODER_NUM_HEADS,
-            intermediate_size=ENCODER_FFN_DIM,
-            max_position_embeddings=ENCODER_MAX_SEQ_LEN,
-            hidden_dropout_prob=ENCODER_DROPOUT,
-            attention_probs_dropout_prob=ENCODER_DROPOUT,
+            vocab_size=30522,
+            hidden_size=768,
+            num_hidden_layers=12,
+            num_attention_heads=12,
+            intermediate_size=3072,
+            max_position_embeddings=1024,
+            hidden_dropout_prob=0.1,
+            attention_probs_dropout_prob=0.1,
             pad_token_id=0,
             type_vocab_size=2,
             num_labels=1,
@@ -259,7 +249,7 @@ def load_cross_encoder(model_path: str):
 
         try:
             model.load_state_dict(state, strict=False)
-        except:
+        except Exception:
             new_state = {}
             for k, v in state.items():
                 if k.startswith("module."):
@@ -283,7 +273,7 @@ def cross_encode_scores(tokenizer, model, query: str, candidates: List[str], bat
     with torch.no_grad():
         for i in range(0, len(candidates), batch_size):
             batch_cands = candidates[i:i+batch_size]
-            enc = tokenizer([query]*len(batch_cands), batch_cands, padding=True, truncation=True,
+            enc = tokenizer([query] * len(batch_cands), batch_cands, padding=True, truncation=True,
                             return_tensors="pt", max_length=512)
 
             out = model(
@@ -335,7 +325,6 @@ def llm_generate_answer(tokenizer, model, query: str, contexts: List[str],
     In this modified pipeline we will call Groq via get_next_client().
     """
     ctx_block = "\n\n---\n".join([f"Passage {i+1}:\n{c}" for i, c in enumerate(contexts)])
-
     prompt = (
         "You are a helpful system that answers the user's question based only on the provided passages.\n"
         "If the answer is not contained within the passages, say 'I don't know'.\n\n"
@@ -447,7 +436,7 @@ class GroqRagasLLM(BaseRagasLLM):
         return True
 
 # ---------------------------
-# Huggingface embeddings wrapper for ragas
+# Embeddings wrapper for ragas
 # ---------------------------
 class CustomHuggingfaceEmbeddings(HuggingfaceEmbeddings):
     """
@@ -481,7 +470,6 @@ class CustomHuggingfaceEmbeddings(HuggingfaceEmbeddings):
 # Utility: load golden CSV
 # ---------------------------
 def load_golden_csv(path: str) -> List[Dict[str, str]]:
-    """Read CSV with columns 'query' and 'answer' (golden)."""
     if not os.path.exists(path):
         raise FileNotFoundError(f"Golden CSV not found: {path}")
     rows = []
@@ -494,9 +482,9 @@ def load_golden_csv(path: str) -> List[Dict[str, str]]:
     return rows
 
 # ---------------------------
-# Main pipeline
+# Main orchestration
 # ---------------------------
-def main():
+def run_ragas_evaluation():
     # 1) open chroma collection
     client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR, settings=Settings(anonymized_telemetry=False))
     try:
@@ -504,32 +492,32 @@ def main():
     except Exception as e:
         raise RuntimeError(f"Could not open Chroma collection '{CHROMA_COLLECTION_NAME}': {e}")
 
-    # 2) load models
-    print("[INFO] Loading encoder and cross-encoder ...")
+    # 2) load encoder and cross-encoder
+    logger.info("[INFO] Loading encoder and cross-encoder ...")
     encoder_tok, encoder_model = load_encoder(ENCODER_MODEL_PATH, tokenizer_dir=ENCODER_TOKENIZER_DIR)
     cross_tok, cross_model = load_cross_encoder(CROSS_ENCODER_MODEL_PATH)
     print("[INFO] Preparing Groq LLM wrapper ...")
     llm_tok, llm_model = load_llm(MODEL_PATH)  # llm_model will be GroqLLMWrapper
 
-    # 3) load golden CSV
+    # 4) load golden csv
     golden = load_golden_csv(GOLDEN_CSV_RELATIVE_PATH)
-    print(f"[INFO] Loaded {len(golden)} golden examples from {GOLDEN_CSV_RELATIVE_PATH}")
+    logger.info(f"[INFO] Loaded {len(golden)} golden examples from {GOLDEN_CSV_RELATIVE_PATH}")
 
-    # 4) generate RAG answers (retrieve -> rerank -> generate)
+    # 5) produce RAG answers by retrieval -> rerank -> generate
     records = []
     for idx, item in enumerate(golden):
         qid = item["id"]
         query = item["query"]
         reference = item["reference"]
 
-        # encode query via encoder
+        # encode query
         try:
             q_emb = encode_texts(encoder_tok, encoder_model, [query], batch_size=1)[0]
         except Exception as e:
-            print(f"[WARN] Encoding query failed for id {qid}: {e}")
+            logger.warning(f"[WARN] Encoding query failed for id {qid}: {e}")
             q_emb = None
 
-        # query chroma for top K
+        # query chroma
         try:
             if q_emb is not None:
                 chroma_res = collection.query(
@@ -539,34 +527,32 @@ def main():
                 )
                 docs = chroma_res.get("documents", [[]])[0]
             else:
-                # fallback: text query (if embeddings failed)
                 chroma_res = collection.query(query_texts=[query], n_results=TOP_K, include=["documents", "metadatas"])
                 docs = chroma_res.get("documents", [[]])[0]
         except Exception as e:
-            print(f"[WARN] Chroma query failed for query id {qid}: {e}")
+            logger.warning(f"[WARN] Chroma query failed for query id {qid}: {e}")
             docs = []
 
         candidates = docs or []
         if len(candidates) == 0:
-            print(f"[WARN] No candidates returned for query id {qid}. Producing empty answer.")
+            logger.warning(f"[WARN] No candidates returned for query id {qid}. Producing empty answer.")
             gen_answer = ""
             contexts = []
         else:
-            # rerank with cross-encoder
             try:
                 scores = cross_encode_scores(cross_tok, cross_model, query, candidates, batch_size=8)
                 scored = list(zip(candidates, scores))
                 scored_sorted = sorted(scored, key=lambda x: x[1], reverse=True)
                 top_m = [c for c, s in scored_sorted[:TOP_M]]
             except Exception as e:
-                print(f"[WARN] Cross-encoder reranking failed for qid {qid}: {e}")
+                logger.warning(f"[WARN] Cross-encoder reranking failed for qid {qid}: {e}")
                 top_m = candidates[:TOP_M]
 
             # generate with Groq (via llm_generate_answer)
             try:
                 gen_answer = llm_generate_answer(llm_tok, llm_model, query, top_m, max_new_tokens=LLM_MAX_NEW_TOKENS, temperature=LLM_TEMPERATURE)
             except Exception as e:
-                print(f"[ERROR] LLM generation failed for qid {qid}: {e}")
+                logger.error(f"[ERROR] LLM generation failed for qid {qid}: {e}")
                 gen_answer = ""
 
             contexts = top_m
@@ -580,10 +566,10 @@ def main():
         })
 
         if (idx + 1) % 10 == 0:
-            print(f"Processed {idx+1}/{len(golden)} queries")
+            logger.info(f"Processed {idx+1}/{len(golden)} queries")
 
-    print("[INFO] Preparing HF Dataset for ragas...")
-    # ragas expects columns like 'question', 'answer', 'contexts', 'ground_truth' (or 'ground_truth' may be optional)
+    # 6) Prepare HF Dataset for ragas
+    logger.info("[INFO] Preparing HF Dataset for ragas...")
     hf_dataset = HFDataset.from_list(records)
 
     # 5) Prepare ragas LLM wrapper and embeddings
@@ -594,7 +580,7 @@ def main():
     EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
     ragas_embeddings = CustomHuggingfaceEmbeddings(EMBED_MODEL)
 
-    # 6) Run ragas.evaluate with full metric set
+    # 8) Metrics: instantiate metric objects (required by ragas 0.3.9)
     metrics_to_run = [
         Faithfulness(),
         AnswerRelevancy(),
@@ -614,27 +600,24 @@ def main():
     end_time = time.time()
     elapsed_min = (end_time - start_time) / 60.0
 
-    # 7) Aggregate & persist results
-    # results is typically a dict mapping metric names to per-example numeric arrays or scalars as ragas returns them
-    # We'll attempt to compute averages for listed metrics and save full results
+    # # 9) Aggregate & persist results
+    # aggregated = {}
+    # try:
+    #     for metric_name in results:
+    #         vals = results[metric_name]
+    #         try:
+    #             arr = np.array(vals, dtype=float)
+    #             aggregated[metric_name] = float(np.nanmean(arr))
+    #         except Exception:
+    #             aggregated[metric_name] = vals
+    # except Exception as e:
+    #     logger.warning(f"[WARN] Error aggregating ragas results: {e}")
+    #     aggregated = results
+    # 9) RAGAS 0.3.9 returns EvaluationResult, not a dict
+    aggregated = results.summaries          # dict: metric → float
+    per_example = results.details           # list of dicts with per-example scores
 
-    aggregated = {}
-    try:
-        # Some ragas versions return dicts with arrays under metric names
-        for metric_name in results:
-            # metric values may be list-like
-            vals = results[metric_name]
-            try:
-                arr = np.array(vals, dtype=float)
-                aggregated[metric_name] = float(np.nanmean(arr))
-            except Exception:
-                # if not numeric list, just store as-is
-                aggregated[metric_name] = vals
-    except Exception as e:
-        print(f"[WARN] Error aggregating ragas results: {e}")
-        aggregated = results
 
-    # Save aggregated metrics and full results
     out_metrics_file = "ragas_metrics.txt"
     out_json_file = "ragas_full_results.json"
     out_per_example = "ragas_per_example.jsonl"
@@ -691,4 +674,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run_ragas_evaluation()
