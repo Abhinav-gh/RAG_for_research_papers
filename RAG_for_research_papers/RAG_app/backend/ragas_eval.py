@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-End-to-end RAG assessment pipeline using Groq LLM (llama3-70b-8192) and official ragas.evaluate()
+Corrected end-to-end RAG + RAGAS evaluation script (compatible with ragas 0.3.9)
 
- - Use encoder -> chroma retrieval (top K)
- - Use cross-encoder -> rerank to top M
- - Use Groq -> generate answer using top M chunks as context + query
- - Run official RAGAS evaluation (multiple metrics via ragas)
-
-Configuration: edit the MODEL paths, CHROMA settings and CSV paths below.
+- Uses your encoder + cross-encoder + Chroma retrieval pipeline
+- Uses HuggingFace LLaMA as generator and as judge (wrapped)
+- Instantiates ragas metrics correctly for ragas 0.3.9
+- Adds a safe fallback for LLaMA loading (GPU -> CPU on OOM)
 """
 
 import csv
@@ -23,17 +21,15 @@ from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassific
 import numpy as np
 import logging
 
-# GROQ import
-from groq import Groq
-
 # Ragas (0.3.9) metric classes
 from ragas import evaluate
 from ragas.metrics import (
     Faithfulness,
     AnswerRelevancy,
+    AnswerCorrectness,
     ContextPrecision,
     ContextRecall,
-    ContextRelevance,
+    # ContextRelevancy,
 )
 from ragas.llms.base import BaseRagasLLM
 from ragas.run_config import RunConfig
@@ -59,20 +55,17 @@ from sentence_transformers import SentenceTransformer
 # ---------------------------
 # Config (paths and models)
 # ---------------------------
-ENCODER_MODEL_PATH = "../../Encoder Fine Tuning/lora_finetuned/lora_bert.pt"
+ENCODER_MODEL_PATH = "../../Encoder_Fine_Tuning/lora_finetuned/lora_bert.pt"
 ENCODER_TOKENIZER_DIR = ""
 CROSS_ENCODER_MODEL_PATH = "../../Cross_Encoder_Reranking/crossenc_lora_out/model_with_lora.pt"
 
-# For compatibility kept as MODEL_PATH variable (not used for Groq directly)
+# Main generator/judge model (user-selected)
 MODEL_PATH = "meta-llama/Llama-3.1-8B-Instruct"
-
-# Groq model name to call
-GROQ_MODEL_NAME = "llama-3.3-70b-versatile"
 
 CHROMA_PERSIST_DIR = "../../VectorDB/chroma_Data_with_Fine_tuned_BERT"
 CHROMA_COLLECTION_NAME = "HP_Chunks_BERT_Embeddings_collection"
 
-GOLDEN_CSV_RELATIVE_PATH = "golden_2_without_commas.csv"
+GOLDEN_CSV_RELATIVE_PATH = "temp.csv"
 
 TOP_K = 10
 TOP_M = 5
@@ -86,27 +79,8 @@ LLM_LOAD_MODE = os.environ.get("LLM_LOAD_MODE", "").lower()  # values: "", "cpu-
 DEVICE = "cuda" if torch.cuda.is_available() and LLM_LOAD_MODE != "cpu-only" else "cpu"
 print(f"Using device: {DEVICE}")
 
-# ---------------------------
-# Groq API keys (placeholders) + round-robin client
-# Replace these placeholders with your real keys.
-# ---------------------------
-API_KEYS = [
-    "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",
-    "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",
-    "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",
-]
-
-_rr_index = 0
-def get_next_client():
-    """
-    Return a Groq client using the next API key in round-robin order.
-    This is intentionally simple — it creates a Groq client per call.
-    If you prefer persistent clients, you can cache them keyed by API key.
-    """
-    global _rr_index
-    key = API_KEYS[_rr_index % len(API_KEYS)]
-    _rr_index = (_rr_index + 1) % len(API_KEYS)
-    return Groq(api_key=key)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # ---------------------------
 # Encoder loader (unchanged logic)
@@ -118,7 +92,7 @@ def load_encoder(model_path: str, tokenizer_dir: str = ""):
         raise FileNotFoundError(f"Encoder model path not found: {model_path}")
 
     if os.path.isdir(model_path):
-        logging.info("[load_encoder] Detected directory model.")
+        logger.info("[load_encoder] Detected directory model.")
         tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
         model = AutoModel.from_pretrained(model_path)
         model.to(DEVICE)
@@ -127,7 +101,7 @@ def load_encoder(model_path: str, tokenizer_dir: str = ""):
 
     _, ext = os.path.splitext(model_path)
     if ext.lower() in [".pt", ".pth", ".bin"]:
-        logging.info(f"[load_encoder] Raw checkpoint: {model_path}")
+        logger.info(f"[load_encoder] Raw checkpoint: {model_path}")
         if tokenizer_dir and os.path.isdir(tokenizer_dir):
             tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir, use_fast=False)
         else:
@@ -147,7 +121,7 @@ def load_encoder(model_path: str, tokenizer_dir: str = ""):
         )
 
         model = BertModel(config)
-        logging.info("[load_encoder] Loading checkpoint...")
+        logger.info("[load_encoder] Loading checkpoint...")
         state = torch.load(model_path, map_location="cpu")
 
         # try common key shapes
@@ -220,7 +194,7 @@ def load_cross_encoder(model_path: str):
 
     _, ext = os.path.splitext(model_path)
     if ext.lower() in [".pt", ".pth", ".bin"]:
-        logging.info(f"[load_cross_encoder] Raw checkpoint: {model_path}")
+        logger.info(f"[load_cross_encoder] Raw checkpoint: {model_path}")
 
         tokenizer = BertTokenizer.from_pretrained("bert-base-uncased", use_fast=False)
 
@@ -293,38 +267,52 @@ def cross_encode_scores(tokenizer, model, query: str, candidates: List[str], bat
     return scores
 
 # ---------------------------
-# Groq-backed LLM loader (returns a simple wrapper object)
+# Load LLaMA with safe fallback on OOM
 # ---------------------------
-class GroqLLMWrapper:
-    """
-    Lightweight wrapper returned by load_llm to keep existing code structure.
-    Consumers call llm_generate_answer(tokenizer, model_wrapper, ...)
-    and the ragas wrapper will also use GroqRagasLLM below.
-    """
-    def __init__(self, model_name: str):
-        self.model_name = model_name
-
 def load_llm(model_path: str):
     """
-    Instead of loading a huge HF model, return (None, GroqLLMWrapper).
-    Kept signature compatible with earlier code which does:
-      llm_tok, llm_model = load_llm(MODEL_PATH)
-    where llm_tok used to be HF tokenizer (unused for Groq path),
-    and llm_model is the model handle used by llm_generate_answer.
+    Attempt to load HF causal LM using GPU (auto) + fp16.
+    On OOM, fall back to CPU (float32) to allow evaluation to proceed (slowly).
     """
-    print(f"[load_llm] Using Groq model wrapper for model: {GROQ_MODEL_NAME}")
-    # return tokenizer as None (not needed) and a small wrapper object
-    return None, GroqLLMWrapper(GROQ_MODEL_NAME)
+    logger.info(f"[load_llm] Loading LLM from HuggingFace Hub: {model_path} (device={DEVICE})")
+
+    # prefer fp16 on GPU
+    preferred_dtype = torch.float16 if DEVICE == "cuda" else torch.float32
+
+    # initial attempt: try device_map="auto" (offload if possible) - may OOM
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=preferred_dtype,
+            device_map="auto" if DEVICE == "cuda" else None,
+        )
+        # ensure pad token
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        logger.info("[load_llm] Loaded model (auto device_map).")
+        return tokenizer, model
+
+    except RuntimeError as e:
+        # Catch CUDA OOM or other runtime errors while attempting GPU load
+        logger.warning(f"[load_llm] Initial HF load failed: {e}. Falling back to CPU.")
+        # attempt CPU-only load (slower, but avoids crashes)
+        tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.float32,
+            device_map={"": "cpu"},
+        )
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        logger.info("[load_llm] Loaded model on CPU (device_map={'': 'cpu'}).")
+        return tokenizer, model
 
 # ---------------------------
-# LLM Generate (for RAG answer generation) — supports Groq wrapper
+# LLM generate helper
 # ---------------------------
 def llm_generate_answer(tokenizer, model, query: str, contexts: List[str],
                         max_new_tokens=128, temperature=0.0):
-    """
-    Generate a concise answer using either HF model (if provided) or Groq wrapper.
-    In this modified pipeline we will call Groq via get_next_client().
-    """
     ctx_block = "\n\n---\n".join([f"Passage {i+1}:\n{c}" for i, c in enumerate(contexts)])
     prompt = (
         "You are a helpful system that answers the user's question based only on the provided passages.\n"
@@ -333,65 +321,28 @@ def llm_generate_answer(tokenizer, model, query: str, contexts: List[str],
         f"Question: {query}\n"
         "Answer concisely:"
     )
-
-    # If model is our GroqLLMWrapper -> call Groq
-    if isinstance(model, GroqLLMWrapper):
-        try:
-            client = get_next_client()
-            # Groq chat completions interface
-            response = client.chat.completions.create(
-                model=model.model_name,
-                temperature=float(temperature),
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=max_new_tokens
-            )
-            # Access message content robustly
-            # response.choices[0].message.content or response.choices[0].message['content']
-            choice = response.choices[0]
-            # Some Groq client shapes may put text in .message.content
-            text = None
-            if hasattr(choice, "message") and hasattr(choice.message, "content"):
-                text = choice.message.content
-            else:
-                # try dict style
-                msg = getattr(choice, "message", None)
-                if isinstance(msg, dict) and "content" in msg:
-                    text = msg["content"]
-            if text is None:
-                # fallback: stringify choice
-                text = str(choice)
-            return text.strip()
-        except Exception as e:
-            print(f"[ERROR] Groq generation failed: {e}")
-            return ""
-    else:
-        # Fallback: if user ever passes HF tokenizer+model, keep previous HF generation behavior
-        if tokenizer is None or model is None:
-            raise RuntimeError("No valid LLM provided for generation.")
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048).to(DEVICE)
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                temperature=temperature,
-                eos_token_id=tokenizer.eos_token_id,
-                pad_token_id=tokenizer.pad_token_id
-            )
-        generated = tokenizer.decode(outputs[0][inputs['input_ids'].shape[-1]:], skip_special_tokens=True).strip()
-        return generated
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048).to(DEVICE)
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            temperature=temperature,
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id
+        )
+    generated = tokenizer.decode(outputs[0][inputs['input_ids'].shape[-1]:], skip_special_tokens=True).strip()
+    return generated
 
 # ---------------------------
-# Groq-backed ragas LLM wrapper implementing BaseRagasLLM
+# Ragas LLM wrapper (implements BaseRagasLLM)
 # ---------------------------
-class GroqRagasLLM(BaseRagasLLM):
-    """
-    Wrap Groq chat completions to satisfy ragas' expected interface.
-    generate_text returns an LLMResult of Generation objects.
-    """
-    def __init__(self, model_name: str, run_config: RunConfig = None):
+class HFRagasLLM(BaseRagasLLM):
+    def __init__(self, tokenizer, model, run_config: RunConfig = None):
         super().__init__(run_config=run_config or RunConfig())
-        self.model_name = model_name
+        self.tokenizer = tokenizer
+        self.model = model
+        self.device = DEVICE
 
     def _prompt_to_text(self, prompt: PromptValue):
         if hasattr(prompt, "to_string"):
@@ -401,36 +352,23 @@ class GroqRagasLLM(BaseRagasLLM):
     def generate_text(self, prompt: PromptValue, n: int = 1, temperature: float = 0.0, stop=None, callbacks=None):
         text_prompt = self._prompt_to_text(prompt)
         gens = []
-        for _ in range(n):
-            # call Groq
-            try:
-                client = get_next_client()
-                response = client.chat.completions.create(
-                    model=self.model_name,
-                    temperature=float(temperature),
-                    messages=[{"role": "user", "content": text_prompt}],
-                    max_tokens=512
+        for i in range(n):
+            inputs = self.tokenizer(text_prompt, return_tensors="pt", truncation=True, max_length=2048).to(DEVICE)
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=256,
+                    do_sample=False if temperature == 0.0 else True,
+                    temperature=temperature,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    pad_token_id=self.tokenizer.pad_token_id,
                 )
-                choice = response.choices[0]
-                # try to extract text
-                text = None
-                if hasattr(choice, "message") and hasattr(choice.message, "content"):
-                    text = choice.message.content
-                else:
-                    msg = getattr(choice, "message", None)
-                    if isinstance(msg, dict) and "content" in msg:
-                        text = msg["content"]
-                if text is None:
-                    text = str(choice)
-                gens.append(Generation(text=text.strip()))
-            except Exception as e:
-                # On failure, provide an error placeholder generation
-                gens.append(Generation(text=f"[Groq error: {e}]"))
-        # ragas expects LLMResult with a list-of-lists of Generation
+            out_text = self.tokenizer.decode(outputs[0][inputs['input_ids'].shape[-1]:], skip_special_tokens=True).strip()
+            gens.append(Generation(text=out_text))
+        # LLMResult expects list-of-list-of-Generation
         return LLMResult(generations=[[g] for g in gens])
 
     async def agenerate_text(self, prompt: PromptValue, n: int = 1, temperature: float = 0.0, stop=None, callbacks=None):
-        # Simple async wrapper calling the sync method (sufficient for ragas)
         return self.generate_text(prompt, n=n, temperature=temperature, stop=stop, callbacks=callbacks)
 
     def is_finished(self, response):
@@ -440,26 +378,14 @@ class GroqRagasLLM(BaseRagasLLM):
 # Embeddings wrapper for ragas
 # ---------------------------
 class CustomHuggingfaceEmbeddings(HuggingfaceEmbeddings):
-    """
-    Adapter that provides:
-     - a string 'model' attribute (the model name) for ragas/pydantic
-     - working embed_documents / embed_query using a SentenceTransformer instance stored privately.
-    """
     def __init__(self, model_name: str):
-        # Keep the model name as a public string attribute (this is what ragas' pydantic validation expects)
-        self.model = model_name  # <-- IMPORTANT: a string, not a SentenceTransformer object
-        # Create the actual encoder instance in a private attribute
-        self._encoder = SentenceTransformer(model_name)
+        self.model = SentenceTransformer(model_name)
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        # Return list[list[float]]
-        embs = self._encoder.encode(texts, show_progress_bar=False)
-        # ensure python lists of floats
-        return [list(map(float, e)) for e in embs]
+        return self.model.encode(texts, show_progress_bar=False).tolist()
 
     def embed_query(self, text: str) -> List[float]:
-        emb = self._encoder.encode([text], show_progress_bar=False)[0]
-        return list(map(float, emb))
+        return self.model.encode([text], show_progress_bar=False)[0].tolist()
 
     async def aembed_documents(self, texts: List[str]):
         return self.embed_documents(texts)
@@ -494,15 +420,17 @@ def run_ragas_evaluation():
         raise RuntimeError(f"Could not open Chroma collection '{CHROMA_COLLECTION_NAME}': {e}")
 
     # 2) load encoder and cross-encoder
-    logging.info("[INFO] Loading encoder and cross-encoder ...")
+    logger.info("[INFO] Loading encoder and cross-encoder ...")
     encoder_tok, encoder_model = load_encoder(ENCODER_MODEL_PATH, tokenizer_dir=ENCODER_TOKENIZER_DIR)
     cross_tok, cross_model = load_cross_encoder(CROSS_ENCODER_MODEL_PATH)
-    print("[INFO] Preparing Groq LLM wrapper ...")
-    llm_tok, llm_model = load_llm(MODEL_PATH)  # llm_model will be GroqLLMWrapper
+
+    # 3) load or attempt to load LLaMA (generator + judge)
+    logger.info("[INFO] Loading generator/judge LLaMA model ...")
+    llm_tok, llm_model = load_llm(MODEL_PATH)
 
     # 4) load golden csv
     golden = load_golden_csv(GOLDEN_CSV_RELATIVE_PATH)
-    logging.info(f"[INFO] Loaded {len(golden)} golden examples from {GOLDEN_CSV_RELATIVE_PATH}")
+    logger.info(f"[INFO] Loaded {len(golden)} golden examples from {GOLDEN_CSV_RELATIVE_PATH}")
 
     # 5) produce RAG answers by retrieval -> rerank -> generate
     records = []
@@ -515,7 +443,7 @@ def run_ragas_evaluation():
         try:
             q_emb = encode_texts(encoder_tok, encoder_model, [query], batch_size=1)[0]
         except Exception as e:
-            logging.warning(f"[WARN] Encoding query failed for id {qid}: {e}")
+            logger.warning(f"[WARN] Encoding query failed for id {qid}: {e}")
             q_emb = None
 
         # query chroma
@@ -531,12 +459,12 @@ def run_ragas_evaluation():
                 chroma_res = collection.query(query_texts=[query], n_results=TOP_K, include=["documents", "metadatas"])
                 docs = chroma_res.get("documents", [[]])[0]
         except Exception as e:
-            logging.warning(f"[WARN] Chroma query failed for query id {qid}: {e}")
+            logger.warning(f"[WARN] Chroma query failed for query id {qid}: {e}")
             docs = []
 
         candidates = docs or []
         if len(candidates) == 0:
-            logging.warning(f"[WARN] No candidates returned for query id {qid}. Producing empty answer.")
+            logger.warning(f"[WARN] No candidates returned for query id {qid}. Producing empty answer.")
             gen_answer = ""
             contexts = []
         else:
@@ -546,14 +474,13 @@ def run_ragas_evaluation():
                 scored_sorted = sorted(scored, key=lambda x: x[1], reverse=True)
                 top_m = [c for c, s in scored_sorted[:TOP_M]]
             except Exception as e:
-                logging.warning(f"[WARN] Cross-encoder reranking failed for qid {qid}: {e}")
+                logger.warning(f"[WARN] Cross-encoder reranking failed for qid {qid}: {e}")
                 top_m = candidates[:TOP_M]
 
-            # generate with Groq (via llm_generate_answer)
             try:
                 gen_answer = llm_generate_answer(llm_tok, llm_model, query, top_m, max_new_tokens=LLM_MAX_NEW_TOKENS, temperature=LLM_TEMPERATURE)
             except Exception as e:
-                logging.error(f"[ERROR] LLM generation failed for qid {qid}: {e}")
+                logger.error(f"[ERROR] LLM generation failed for qid {qid}: {e}")
                 gen_answer = ""
 
             contexts = top_m
@@ -567,30 +494,27 @@ def run_ragas_evaluation():
         })
 
         if (idx + 1) % 10 == 0:
-            logging.info(f"Processed {idx+1}/{len(golden)} queries")
+            logger.info(f"Processed {idx+1}/{len(golden)} queries")
 
     # 6) Prepare HF Dataset for ragas
-    logging.info("[INFO] Preparing HF Dataset for ragas...")
+    logger.info("[INFO] Preparing HF Dataset for ragas...")
     hf_dataset = HFDataset.from_list(records)
 
-    # 5) Prepare ragas LLM wrapper and embeddings
-    print("[INFO] Wrapping Groq for ragas (LLM & embeddings)...")
-    ragas_llm = GroqRagasLLM(model_name=GROQ_MODEL_NAME, run_config=RunConfig())
-
-    # Use a SentenceTransformer embedding model for ragas (same as earlier)
-    EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-    ragas_embeddings = CustomHuggingfaceEmbeddings(EMBED_MODEL)
+    # 7) ragas LLM wrapper + embeddings
+    logger.info("[INFO] Wrapping LLaMA for ragas (LLM & embeddings)...")
+    ragas_llm = HFRagasLLM(tokenizer=llm_tok, model=llm_model, run_config=RunConfig())
+    ragas_embeddings = CustomHuggingfaceEmbeddings("sentence-transformers/all-MiniLM-L6-v2")
 
     # 8) Metrics: instantiate metric objects (required by ragas 0.3.9)
     metrics_to_run = [
         Faithfulness(),
         AnswerRelevancy(),
+        AnswerCorrectness(),
         ContextPrecision(),
         ContextRecall(),
-        ContextRelevance(),
+        # ContextRelevancy(),
     ]
-
-    print("[INFO] Running ragas.evaluate() - this will call the wrapped Groq many times for judge prompts...")
+    logger.info("[INFO] Running ragas.evaluate() - this will call the wrapped LLaMA many times for judge prompts...")
     start_time = time.time()
     results = evaluate(
         dataset=hf_dataset,
@@ -612,66 +536,91 @@ def run_ragas_evaluation():
     #         except Exception:
     #             aggregated[metric_name] = vals
     # except Exception as e:
-    #     logging.warning(f"[WARN] Error aggregating ragas results: {e}")
+    #     logger.warning(f"[WARN] Error aggregating ragas results: {e}")
     #     aggregated = results
-    # 9) RAGAS 0.3.9 returns EvaluationResult, not a dict
-    aggregated = results.summaries          # dict: metric → float
-    per_example = results.details           # list of dicts with per-example scores
+    # 9) Extract aggregate + per-example correctly for ragas 0.3.9
+    aggregated = results._repr_dict              # dict: metric -> aggregate float
+    per_example = results._scores_dict           # dict: metric -> list of floats
+
 
 
     out_metrics_file = "ragas_metrics.txt"
     out_json_file = "ragas_full_results.json"
     out_per_example = "ragas_per_example.jsonl"
 
-    print("[INFO] Writing results to disk...")
-    try:
-        with open(out_metrics_file, "w", encoding="utf-8") as f:
-            f.write("=== RAGAS aggregated metrics ===\n")
-            f.write(f"Time: {time.ctime()}\n")
-            f.write(f"Duration (minutes): {elapsed_min:.2f}\n\n")
-            f.write(json.dumps(aggregated, indent=2))
-            f.write("\n\n=== Full raw results object ===\n")
-            f.write(json.dumps(results, indent=2, default=str))
-        print(f"Aggregated metrics saved to {out_metrics_file}")
-    except Exception as e:
-        print(f"[ERROR] Could not write aggregated metrics: {e}")
+    # logger.info("[INFO] Writing results to disk...")
+    # try:
+    #     with open(out_metrics_file, "w", encoding="utf-8") as f:
+    #         f.write("=== RAGAS aggregated metrics ===\n")
+    #         f.write(f"Time: {time.ctime()}\n")
+    #         f.write(f"Duration (minutes): {elapsed_min:.2f}\n\n")
+    #         f.write(json.dumps(aggregated, indent=2))
+    #         f.write("\n\n=== Full raw results object ===\n")
+    #         f.write(json.dumps(results, indent=2, default=str))
+    #     logger.info(f"Aggregated metrics saved to {out_metrics_file}")
+    # except Exception as e:
+    #     logger.error(f"[ERROR] Could not write aggregated metrics: {e}")
 
-    try:
-        with open(out_json_file, "w", encoding="utf-8") as f:
-            json.dump(results, f, indent=2, default=str)
-        print(f"Full results saved to {out_json_file}")
-    except Exception as e:
-        print(f"[ERROR] Could not write full results JSON: {e}")
+    # try:
+    #     with open(out_json_file, "w", encoding="utf-8") as f:
+    #         json.dump(results, f, indent=2, default=str)
+    #     logger.info(f"Full results saved to {out_json_file}")
+    # except Exception as e:
+    #     logger.error(f"[ERROR] Could not write full results JSON: {e}")
 
-    # Write per-example items (if results contain per-example lists, attempt to reconstruct)
-    try:
-        # We will serialize the records plus metric values where available
-        per_example = []
-        n = len(records)
-        # Try to collate per-example metric arrays inside results if they exist
-        # results may be: { 'faithfulness': [..], 'answer_relevancy': [..], ... }
-        # We'll construct an entry per record with metrics
-        for i, rec in enumerate(records):
-            entry = dict(rec)  # id, question, answer, contexts, ground_truth
-            for metric_name, metric_vals in results.items():
-                try:
-                    entry[metric_name] = metric_vals[i]
-                except Exception:
-                    # metric maybe scalar or missing; skip
-                    pass
-            per_example.append(entry)
+    # # Per-example output
+    # try:
+    #     per_example = []
+    #     for i, rec in enumerate(records):
+    #         entry = dict(rec)
+    #         for metric_name, metric_vals in results.items():
+    #             try:
+    #                 entry[metric_name] = metric_vals[i]
+    #             except Exception:
+    #                 pass
+    #         per_example.append(entry)
 
-        with open(out_per_example, "w", encoding="utf-8") as f:
-            for ex in per_example:
-                f.write(json.dumps(ex, ensure_ascii=False) + "\n")
-        print(f"Per-example results saved to {out_per_example}")
-    except Exception as e:
-        print(f"[ERROR] Could not write per-example results: {e}")
+    #     with open(out_per_example, "w", encoding="utf-8") as f:
+    #         for ex in per_example:
+    #             f.write(json.dumps(ex, ensure_ascii=False) + "\n")
+    #     logger.info(f"Per-example results saved to {out_per_example}")
+    # except Exception as e:
+    #     logger.error(f"[ERROR] Could not write per-example results: {e}")
 
-    print("Done. Summary:")
-    print("Elapsed (minutes):", elapsed_min)
-    print("Aggregated metrics (sample):")
-    print(json.dumps(aggregated, indent=2, default=str))
+    # logger.info("Done. Summary:")
+    # logger.info("Elapsed (minutes): %.2f", elapsed_min)
+    # logger.info("Aggregated metrics (sample): %s", json.dumps(aggregated, indent=2))
+    logger.info("[INFO] Writing results to disk...")
+
+    # aggregated metrics → ragas_metrics.txt
+    with open(out_metrics_file, "w", encoding="utf-8") as f:
+        f.write("=== RAGAS aggregated metrics ===\n")
+        f.write(f"Time: {time.ctime()}\n")
+        f.write(f"Duration (minutes): {elapsed_min:.2f}\n\n")
+        for k, v in aggregated.items():
+            f.write(f"{k}: {v}\n")
+
+    logger.info(f"Aggregated metrics saved to {out_metrics_file}")
+
+    # full results (converted manually)
+    with open(out_json_file, "w", encoding="utf-8") as f:
+        json.dump({
+            "aggregated": aggregated,
+            "per_example": per_example
+        }, f, indent=2)
+
+    logger.info(f"Full results saved to {out_json_file}")
+
+    # per-example JSONL
+    with open(out_per_example, "w", encoding="utf-8") as f:
+        for ex in per_example:
+            f.write(json.dumps(ex, ensure_ascii=False) + "\n")
+
+    logger.info(f"Per-example results saved to {out_per_example}")
+
+    logger.info("Done. Summary:")
+    logger.info("Elapsed (minutes): %.2f", elapsed_min)
+    logger.info("Aggregated metrics (sample): %s", json.dumps(aggregated, indent=2))
 
 
 if __name__ == "__main__":

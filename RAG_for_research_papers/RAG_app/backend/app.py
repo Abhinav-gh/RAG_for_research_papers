@@ -7,6 +7,7 @@ from backend.ragas_eval import run_ragas_evaluation
 from backend.utils import health_check, get_model_info
 from backend.encoder_model import BertEncoder
 from backend.chromadb_utils import ChromaDBClient
+from backend.gemini_answer import GeminiAnswerGenerator
 
 
 import os
@@ -30,6 +31,13 @@ app = FastAPI()
 model_wrapper = CrossEncoderLoRAWrapper()
 encoder = BertEncoder()
 
+# Gemini API keys (replace with your actual keys)
+GEMINI_API_KEYS = [
+    os.getenv("GEMINI_API_KEY_1", "AIzaSyCpIuRgZJI9HLO01CruxSppbKjO6EhnQIc"),
+    os.getenv("GEMINI_API_KEY_2", "AIzaSyCOQ5_Rk377xfh_C5yrTom-f-MTVOkh6Q4"),
+]
+answer_generator = GeminiAnswerGenerator(GEMINI_API_KEYS)
+
 class QueryRequest(BaseModel):
 	query: str
 	top_k: int = 10
@@ -51,7 +59,6 @@ def model_info():
 def query_endpoint(request: QueryRequest):
     print(">>> Query received:", request.query)
 
-    
     query_emb = encoder.embed(request.query)
     print(">>> Query embedding shape:", query_emb.shape)
 
@@ -60,26 +67,38 @@ def query_endpoint(request: QueryRequest):
     chunks, chunk_ids = chroma.query(query_emb, top_k=request.top_k)
 
     print(">>> Retrieved chunks count:", len(chunks))
+
+    # Print full chunks, not truncated
+    for i, ch in enumerate(chunks):
+        print(f"\n----- FULL CHUNK {i} (len={len(ch)}) -----")
+        print(ch)
+        print("----------------------------------------\n")
+
     print(">>> Retrieved chunk_ids:", chunk_ids)
+
 
     if len(chunks) == 0:
         print(">>> NO CHUNKS RETURNED BY CHROMA")
         return {"answer": "", "contexts": []}
 
     # Step 3: Reranking
-    scores = []
     probs = model_wrapper.predict_batch(request.query, chunks)
     scores = list(zip(chunks, probs))
-
-
     print(">>> Raw reranking scores:", scores)
-
     scores.sort(key=lambda x: x[1], reverse=True)
     top_chunks = [chunk for chunk, score in scores[:request.top_m]]
-
     print(">>> Top reranked chunks:", top_chunks)
 
-    return {"answer": "", "contexts": top_chunks}
+    # Step 4: Answer generation using Gemini API
+    answer = answer_generator.generate_answer(request.query, top_chunks)
+    print(">>> Gemini answer:", answer)
+
+    return {
+        "answer": answer,
+        "contexts": top_chunks,
+        "chunk_ids": chunk_ids[:request.top_m]
+    }
+
 
 
 @app.post("/evaluate")
