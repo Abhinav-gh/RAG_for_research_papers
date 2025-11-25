@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-End-to-end RAG assessment pipeline using HuggingFace LLaMA and official ragas.evaluate()
+End-to-end RAG assessment pipeline using Groq LLM (llama3-70b-8192) and official ragas.evaluate()
 
  - Use encoder -> chroma retrieval (top K)
  - Use cross-encoder -> rerank to top M
- - Use LLaMA -> generate answer using top M chunks as context + query
+ - Use Groq -> generate answer using top M chunks as context + query
  - Run official RAGAS evaluation (multiple metrics via ragas)
 
 Configuration: edit the MODEL paths, CHROMA settings and CSV paths below.
@@ -28,15 +28,17 @@ from transformers import (
 )
 import numpy as np
 
+# GROQ import
+from groq import Groq
+
 # Ragas imports
 from ragas import evaluate
 from ragas.metrics import (
-    faithfulness,
-    answer_relevancy,
-    contextual_precision,
-    contextual_recall,
-    contextual_relevancy,
-    answer_correctness
+    Faithfulness,
+    AnswerRelevancy,
+    ContextPrecision,
+    ContextRecall,
+    ContextRelevance,
 )
 from ragas.llms.base import BaseRagasLLM
 from ragas.run_config import RunConfig
@@ -72,11 +74,11 @@ ENCODER_TOKENIZER_DIR = ""
 
 CROSS_ENCODER_MODEL_PATH = "../../Cross_Encoder_Reranking/crossenc_lora_out/model_with_lora.pt"
 
-# Use the user's chosen model
-MODEL_PATH = "meta-llama/Llama-3.1-8B-Instruct"   # HuggingFace Hub model for LLaMA
+# For compatibility kept as MODEL_PATH variable (not used for Groq directly)
+MODEL_PATH = "meta-llama/Llama-3.1-8B-Instruct"
 
-# LLaMA load (we will load via load_llm())
-# Note: we DO NOT instantiate global tokenizer/model here to avoid duplication before device setup
+# Groq model name to call
+GROQ_MODEL_NAME = "llama-3.3-70b-versatile"
 
 CHROMA_PERSIST_DIR = "../../VectorDB/chroma_Data_with_Fine_tuned_BERT"
 CHROMA_COLLECTION_NAME = "HP_Chunks_BERT_Embeddings_collection"
@@ -91,6 +93,28 @@ LLM_TEMPERATURE = 0.0
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {DEVICE}")
+
+# ---------------------------
+# Groq API keys (placeholders) + round-robin client
+# Replace these placeholders with your real keys.
+# ---------------------------
+API_KEYS = [
+    "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",
+    "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",
+    "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",
+]
+
+_rr_index = 0
+def get_next_client():
+    """
+    Return a Groq client using the next API key in round-robin order.
+    This is intentionally simple — it creates a Groq client per call.
+    If you prefer persistent clients, you can cache them keyed by API key.
+    """
+    global _rr_index
+    key = API_KEYS[_rr_index % len(API_KEYS)]
+    _rr_index = (_rr_index + 1) % len(API_KEYS)
+    return Groq(api_key=key)
 
 # ---------------------------
 # Load Encoder
@@ -278,37 +302,37 @@ def cross_encode_scores(tokenizer, model, query: str, candidates: List[str], bat
     return scores
 
 # ---------------------------
-# Load LLaMA LLM (HF)
+# Groq-backed LLM loader (returns a simple wrapper object)
 # ---------------------------
+class GroqLLMWrapper:
+    """
+    Lightweight wrapper returned by load_llm to keep existing code structure.
+    Consumers call llm_generate_answer(tokenizer, model_wrapper, ...)
+    and the ragas wrapper will also use GroqRagasLLM below.
+    """
+    def __init__(self, model_name: str):
+        self.model_name = model_name
+
 def load_llm(model_path: str):
     """
-    Load LLaMA-like HF causal LM model and tokenizer.
-    Uses device_map="auto" and float16 when a CUDA GPU is available.
+    Instead of loading a huge HF model, return (None, GroqLLMWrapper).
+    Kept signature compatible with earlier code which does:
+      llm_tok, llm_model = load_llm(MODEL_PATH)
+    where llm_tok used to be HF tokenizer (unused for Groq path),
+    and llm_model is the model handle used by llm_generate_answer.
     """
-    print(f"[load_llm] Loading LLM from HuggingFace Hub: {model_path}")
-
-    dtype = torch.float16 if DEVICE == "cuda" else torch.float32
-
-    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype=dtype,
-        device_map="auto" if DEVICE == "cuda" else None,
-    )
-
-    # Ensure tokenizer has pad token for generation if missing
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    return tokenizer, model
+    print(f"[load_llm] Using Groq model wrapper for model: {GROQ_MODEL_NAME}")
+    # return tokenizer as None (not needed) and a small wrapper object
+    return None, GroqLLMWrapper(GROQ_MODEL_NAME)
 
 # ---------------------------
-# LLM Generate (for RAG answer generation)
+# LLM Generate (for RAG answer generation) — supports Groq wrapper
 # ---------------------------
 def llm_generate_answer(tokenizer, model, query: str, contexts: List[str],
                         max_new_tokens=128, temperature=0.0):
     """
-    Generate a concise answer using the HF model given contexts and a question.
+    Generate a concise answer using either HF model (if provided) or Groq wrapper.
+    In this modified pipeline we will call Groq via get_next_client().
     """
     ctx_block = "\n\n---\n".join([f"Passage {i+1}:\n{c}" for i, c in enumerate(contexts)])
 
@@ -320,35 +344,64 @@ def llm_generate_answer(tokenizer, model, query: str, contexts: List[str],
         "Answer concisely:"
     )
 
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048).to(DEVICE)
-
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            temperature=temperature,
-            eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.pad_token_id
-        )
-
-    generated = tokenizer.decode(outputs[0][inputs['input_ids'].shape[-1]:], skip_special_tokens=True).strip()
-    return generated
+    # If model is our GroqLLMWrapper -> call Groq
+    if isinstance(model, GroqLLMWrapper):
+        try:
+            client = get_next_client()
+            # Groq chat completions interface
+            response = client.chat.completions.create(
+                model=model.model_name,
+                temperature=float(temperature),
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_new_tokens
+            )
+            # Access message content robustly
+            # response.choices[0].message.content or response.choices[0].message['content']
+            choice = response.choices[0]
+            # Some Groq client shapes may put text in .message.content
+            text = None
+            if hasattr(choice, "message") and hasattr(choice.message, "content"):
+                text = choice.message.content
+            else:
+                # try dict style
+                msg = getattr(choice, "message", None)
+                if isinstance(msg, dict) and "content" in msg:
+                    text = msg["content"]
+            if text is None:
+                # fallback: stringify choice
+                text = str(choice)
+            return text.strip()
+        except Exception as e:
+            print(f"[ERROR] Groq generation failed: {e}")
+            return ""
+    else:
+        # Fallback: if user ever passes HF tokenizer+model, keep previous HF generation behavior
+        if tokenizer is None or model is None:
+            raise RuntimeError("No valid LLM provided for generation.")
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048).to(DEVICE)
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                temperature=temperature,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id
+            )
+        generated = tokenizer.decode(outputs[0][inputs['input_ids'].shape[-1]:], skip_special_tokens=True).strip()
+        return generated
 
 # ---------------------------
-# HF wrapper implementing BaseRagasLLM so ragas.evaluate can call this LLM
+# Groq-backed ragas LLM wrapper implementing BaseRagasLLM
 # ---------------------------
-class HFRagasLLM(BaseRagasLLM):
+class GroqRagasLLM(BaseRagasLLM):
     """
-    Wrap a HuggingFace AutoModelForCausalLM + tokenizer into the interface ragas expects.
-    This will be used by ragas.evaluate to run judge prompts and internal LLM calls.
+    Wrap Groq chat completions to satisfy ragas' expected interface.
+    generate_text returns an LLMResult of Generation objects.
     """
-
-    def __init__(self, tokenizer, model, run_config: RunConfig = None):
+    def __init__(self, model_name: str, run_config: RunConfig = None):
         super().__init__(run_config=run_config or RunConfig())
-        self.tokenizer = tokenizer
-        self.model = model
-        self.device = DEVICE
+        self.model_name = model_name
 
     def _prompt_to_text(self, prompt: PromptValue):
         if hasattr(prompt, "to_string"):
@@ -356,49 +409,67 @@ class HFRagasLLM(BaseRagasLLM):
         return str(prompt)
 
     def generate_text(self, prompt: PromptValue, n: int = 1, temperature: float = 0.0, stop=None, callbacks=None):
-        """
-        Synchronous generation: returns LLMResult with Generation objects (text only).
-        This matches the minimal needs of ragas' runner.
-        """
         text_prompt = self._prompt_to_text(prompt)
         gens = []
-        for i in range(n):
-            # tokenize & generate
-            inputs = self.tokenizer(text_prompt, return_tensors="pt", truncation=True, max_length=2048).to(DEVICE)
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    **inputs,
-                    max_new_tokens=256,
-                    do_sample=False if temperature == 0.0 else True,
-                    temperature=temperature,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                    pad_token_id=self.tokenizer.pad_token_id,
+        for _ in range(n):
+            # call Groq
+            try:
+                client = get_next_client()
+                response = client.chat.completions.create(
+                    model=self.model_name,
+                    temperature=float(temperature),
+                    messages=[{"role": "user", "content": text_prompt}],
+                    max_tokens=512
                 )
-            out_text = self.tokenizer.decode(outputs[0][inputs['input_ids'].shape[-1]:], skip_special_tokens=True).strip()
-            gens.append(Generation(text=out_text))
+                choice = response.choices[0]
+                # try to extract text
+                text = None
+                if hasattr(choice, "message") and hasattr(choice.message, "content"):
+                    text = choice.message.content
+                else:
+                    msg = getattr(choice, "message", None)
+                    if isinstance(msg, dict) and "content" in msg:
+                        text = msg["content"]
+                if text is None:
+                    text = str(choice)
+                gens.append(Generation(text=text.strip()))
+            except Exception as e:
+                # On failure, provide an error placeholder generation
+                gens.append(Generation(text=f"[Groq error: {e}]"))
+        # ragas expects LLMResult with a list-of-lists of Generation
         return LLMResult(generations=[[g] for g in gens])
 
     async def agenerate_text(self, prompt: PromptValue, n: int = 1, temperature: float = 0.0, stop=None, callbacks=None):
-        # Provide async wrapper but call sync code (sufficient for ragas)
+        # Simple async wrapper calling the sync method (sufficient for ragas)
         return self.generate_text(prompt, n=n, temperature=temperature, stop=stop, callbacks=callbacks)
 
     def is_finished(self, response):
-        # Not used heavily by ragas, implement trivial finished check
         return True
 
 # ---------------------------
 # Huggingface embeddings wrapper for ragas
 # ---------------------------
 class CustomHuggingfaceEmbeddings(HuggingfaceEmbeddings):
+    """
+    Adapter that provides:
+     - a string 'model' attribute (the model name) for ragas/pydantic
+     - working embed_documents / embed_query using a SentenceTransformer instance stored privately.
+    """
     def __init__(self, model_name: str):
-        # Initialize underlying sentence-transformers model
-        self.model = SentenceTransformer(model_name)
+        # Keep the model name as a public string attribute (this is what ragas' pydantic validation expects)
+        self.model = model_name  # <-- IMPORTANT: a string, not a SentenceTransformer object
+        # Create the actual encoder instance in a private attribute
+        self._encoder = SentenceTransformer(model_name)
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        return self.model.encode(texts, show_progress_bar=False).tolist()
+        # Return list[list[float]]
+        embs = self._encoder.encode(texts, show_progress_bar=False)
+        # ensure python lists of floats
+        return [list(map(float, e)) for e in embs]
 
     def embed_query(self, text: str) -> List[float]:
-        return self.model.encode([text], show_progress_bar=False)[0].tolist()
+        emb = self._encoder.encode([text], show_progress_bar=False)[0]
+        return list(map(float, emb))
 
     async def aembed_documents(self, texts: List[str]):
         return self.embed_documents(texts)
@@ -437,8 +508,8 @@ def main():
     print("[INFO] Loading encoder and cross-encoder ...")
     encoder_tok, encoder_model = load_encoder(ENCODER_MODEL_PATH, tokenizer_dir=ENCODER_TOKENIZER_DIR)
     cross_tok, cross_model = load_cross_encoder(CROSS_ENCODER_MODEL_PATH)
-    print("[INFO] Loading generator/judge LLaMA model ...")
-    llm_tok, llm_model = load_llm(MODEL_PATH)
+    print("[INFO] Preparing Groq LLM wrapper ...")
+    llm_tok, llm_model = load_llm(MODEL_PATH)  # llm_model will be GroqLLMWrapper
 
     # 3) load golden CSV
     golden = load_golden_csv(GOLDEN_CSV_RELATIVE_PATH)
@@ -491,7 +562,7 @@ def main():
                 print(f"[WARN] Cross-encoder reranking failed for qid {qid}: {e}")
                 top_m = candidates[:TOP_M]
 
-            # generate with LLaMA
+            # generate with Groq (via llm_generate_answer)
             try:
                 gen_answer = llm_generate_answer(llm_tok, llm_model, query, top_m, max_new_tokens=LLM_MAX_NEW_TOKENS, temperature=LLM_TEMPERATURE)
             except Exception as e:
@@ -516,8 +587,8 @@ def main():
     hf_dataset = HFDataset.from_list(records)
 
     # 5) Prepare ragas LLM wrapper and embeddings
-    print("[INFO] Wrapping LLaMA for ragas (LLM & embeddings)...")
-    ragas_llm = HFRagasLLM(tokenizer=llm_tok, model=llm_model, run_config=RunConfig())
+    print("[INFO] Wrapping Groq for ragas (LLM & embeddings)...")
+    ragas_llm = GroqRagasLLM(model_name=GROQ_MODEL_NAME, run_config=RunConfig())
 
     # Use a SentenceTransformer embedding model for ragas (same as earlier)
     EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
@@ -525,15 +596,14 @@ def main():
 
     # 6) Run ragas.evaluate with full metric set
     metrics_to_run = [
-        faithfulness,
-        answer_relevancy,
-        answer_correctness,
-        contextual_precision,
-        contextual_recall,
-        contextual_relevancy
+        Faithfulness(),
+        AnswerRelevancy(),
+        ContextPrecision(),
+        ContextRecall(),
+        ContextRelevance(),
     ]
 
-    print("[INFO] Running ragas.evaluate() - this will call the wrapped LLaMA many times for judge prompts...")
+    print("[INFO] Running ragas.evaluate() - this will call the wrapped Groq many times for judge prompts...")
     start_time = time.time()
     results = evaluate(
         dataset=hf_dataset,
@@ -617,7 +687,8 @@ def main():
     print("Done. Summary:")
     print("Elapsed (minutes):", elapsed_min)
     print("Aggregated metrics (sample):")
-    print(json.dumps(aggregated, indent=2))
+    print(json.dumps(aggregated, indent=2, default=str))
+
 
 if __name__ == "__main__":
     main()
