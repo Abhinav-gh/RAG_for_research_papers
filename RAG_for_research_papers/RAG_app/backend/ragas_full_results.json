@@ -1,0 +1,26 @@
+{
+  "aggregated": {
+    "faithfulness": NaN,
+    "answer_relevancy": NaN,
+    "answer_correctness": NaN,
+    "context_precision": NaN,
+    "context_recall": NaN
+  },
+  "per_example": {
+    "faithfulness": [
+      NaN
+    ],
+    "answer_relevancy": [
+      NaN
+    ],
+    "answer_correctness": [
+      NaN
+    ],
+    "context_precision": [
+      NaN
+    ],
+    "context_recall": [
+      NaN
+    ]
+  }
+}
