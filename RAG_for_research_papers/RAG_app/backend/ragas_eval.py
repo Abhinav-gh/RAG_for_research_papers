@@ -21,6 +21,7 @@ import chromadb
 from chromadb.config import Settings
 from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification, AutoModelForCausalLM
 import numpy as np
+import logging
 
 # GROQ import
 from groq import Groq
@@ -58,7 +59,7 @@ from sentence_transformers import SentenceTransformer
 # ---------------------------
 # Config (paths and models)
 # ---------------------------
-ENCODER_MODEL_PATH = "../../Encoder_Fine_Tuning/lora_finetuned/lora_bert.pt"
+ENCODER_MODEL_PATH = "../../Encoder Fine Tuning/lora_finetuned/lora_bert.pt"
 ENCODER_TOKENIZER_DIR = ""
 CROSS_ENCODER_MODEL_PATH = "../../Cross_Encoder_Reranking/crossenc_lora_out/model_with_lora.pt"
 
@@ -71,7 +72,7 @@ GROQ_MODEL_NAME = "llama-3.3-70b-versatile"
 CHROMA_PERSIST_DIR = "../../VectorDB/chroma_Data_with_Fine_tuned_BERT"
 CHROMA_COLLECTION_NAME = "HP_Chunks_BERT_Embeddings_collection"
 
-GOLDEN_CSV_RELATIVE_PATH = "temp.csv"
+GOLDEN_CSV_RELATIVE_PATH = "golden_2_without_commas.csv"
 
 TOP_K = 10
 TOP_M = 5
@@ -117,7 +118,7 @@ def load_encoder(model_path: str, tokenizer_dir: str = ""):
         raise FileNotFoundError(f"Encoder model path not found: {model_path}")
 
     if os.path.isdir(model_path):
-        logger.info("[load_encoder] Detected directory model.")
+        logging.info("[load_encoder] Detected directory model.")
         tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
         model = AutoModel.from_pretrained(model_path)
         model.to(DEVICE)
@@ -126,7 +127,7 @@ def load_encoder(model_path: str, tokenizer_dir: str = ""):
 
     _, ext = os.path.splitext(model_path)
     if ext.lower() in [".pt", ".pth", ".bin"]:
-        logger.info(f"[load_encoder] Raw checkpoint: {model_path}")
+        logging.info(f"[load_encoder] Raw checkpoint: {model_path}")
         if tokenizer_dir and os.path.isdir(tokenizer_dir):
             tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir, use_fast=False)
         else:
@@ -146,7 +147,7 @@ def load_encoder(model_path: str, tokenizer_dir: str = ""):
         )
 
         model = BertModel(config)
-        logger.info("[load_encoder] Loading checkpoint...")
+        logging.info("[load_encoder] Loading checkpoint...")
         state = torch.load(model_path, map_location="cpu")
 
         # try common key shapes
@@ -219,7 +220,7 @@ def load_cross_encoder(model_path: str):
 
     _, ext = os.path.splitext(model_path)
     if ext.lower() in [".pt", ".pth", ".bin"]:
-        logger.info(f"[load_cross_encoder] Raw checkpoint: {model_path}")
+        logging.info(f"[load_cross_encoder] Raw checkpoint: {model_path}")
 
         tokenizer = BertTokenizer.from_pretrained("bert-base-uncased", use_fast=False)
 
@@ -493,7 +494,7 @@ def run_ragas_evaluation():
         raise RuntimeError(f"Could not open Chroma collection '{CHROMA_COLLECTION_NAME}': {e}")
 
     # 2) load encoder and cross-encoder
-    logger.info("[INFO] Loading encoder and cross-encoder ...")
+    logging.info("[INFO] Loading encoder and cross-encoder ...")
     encoder_tok, encoder_model = load_encoder(ENCODER_MODEL_PATH, tokenizer_dir=ENCODER_TOKENIZER_DIR)
     cross_tok, cross_model = load_cross_encoder(CROSS_ENCODER_MODEL_PATH)
     print("[INFO] Preparing Groq LLM wrapper ...")
@@ -501,7 +502,7 @@ def run_ragas_evaluation():
 
     # 4) load golden csv
     golden = load_golden_csv(GOLDEN_CSV_RELATIVE_PATH)
-    logger.info(f"[INFO] Loaded {len(golden)} golden examples from {GOLDEN_CSV_RELATIVE_PATH}")
+    logging.info(f"[INFO] Loaded {len(golden)} golden examples from {GOLDEN_CSV_RELATIVE_PATH}")
 
     # 5) produce RAG answers by retrieval -> rerank -> generate
     records = []
@@ -514,7 +515,7 @@ def run_ragas_evaluation():
         try:
             q_emb = encode_texts(encoder_tok, encoder_model, [query], batch_size=1)[0]
         except Exception as e:
-            logger.warning(f"[WARN] Encoding query failed for id {qid}: {e}")
+            logging.warning(f"[WARN] Encoding query failed for id {qid}: {e}")
             q_emb = None
 
         # query chroma
@@ -530,12 +531,12 @@ def run_ragas_evaluation():
                 chroma_res = collection.query(query_texts=[query], n_results=TOP_K, include=["documents", "metadatas"])
                 docs = chroma_res.get("documents", [[]])[0]
         except Exception as e:
-            logger.warning(f"[WARN] Chroma query failed for query id {qid}: {e}")
+            logging.warning(f"[WARN] Chroma query failed for query id {qid}: {e}")
             docs = []
 
         candidates = docs or []
         if len(candidates) == 0:
-            logger.warning(f"[WARN] No candidates returned for query id {qid}. Producing empty answer.")
+            logging.warning(f"[WARN] No candidates returned for query id {qid}. Producing empty answer.")
             gen_answer = ""
             contexts = []
         else:
@@ -545,14 +546,14 @@ def run_ragas_evaluation():
                 scored_sorted = sorted(scored, key=lambda x: x[1], reverse=True)
                 top_m = [c for c, s in scored_sorted[:TOP_M]]
             except Exception as e:
-                logger.warning(f"[WARN] Cross-encoder reranking failed for qid {qid}: {e}")
+                logging.warning(f"[WARN] Cross-encoder reranking failed for qid {qid}: {e}")
                 top_m = candidates[:TOP_M]
 
             # generate with Groq (via llm_generate_answer)
             try:
                 gen_answer = llm_generate_answer(llm_tok, llm_model, query, top_m, max_new_tokens=LLM_MAX_NEW_TOKENS, temperature=LLM_TEMPERATURE)
             except Exception as e:
-                logger.error(f"[ERROR] LLM generation failed for qid {qid}: {e}")
+                logging.error(f"[ERROR] LLM generation failed for qid {qid}: {e}")
                 gen_answer = ""
 
             contexts = top_m
@@ -566,10 +567,10 @@ def run_ragas_evaluation():
         })
 
         if (idx + 1) % 10 == 0:
-            logger.info(f"Processed {idx+1}/{len(golden)} queries")
+            logging.info(f"Processed {idx+1}/{len(golden)} queries")
 
     # 6) Prepare HF Dataset for ragas
-    logger.info("[INFO] Preparing HF Dataset for ragas...")
+    logging.info("[INFO] Preparing HF Dataset for ragas...")
     hf_dataset = HFDataset.from_list(records)
 
     # 5) Prepare ragas LLM wrapper and embeddings
@@ -611,7 +612,7 @@ def run_ragas_evaluation():
     #         except Exception:
     #             aggregated[metric_name] = vals
     # except Exception as e:
-    #     logger.warning(f"[WARN] Error aggregating ragas results: {e}")
+    #     logging.warning(f"[WARN] Error aggregating ragas results: {e}")
     #     aggregated = results
     # 9) RAGAS 0.3.9 returns EvaluationResult, not a dict
     aggregated = results.summaries          # dict: metric → float
